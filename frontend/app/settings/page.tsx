@@ -40,7 +40,7 @@ export default function SettingsPage() {
           onChange={(e) => setGithubRepo(e.target.value)}
         />
       </div>
-
+    
       <button style={{ marginTop: "1.5rem" }} onClick={saveSettings}>
         Save
       </button>
