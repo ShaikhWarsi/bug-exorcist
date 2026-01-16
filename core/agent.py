@@ -3,12 +3,14 @@ core/agent.py - The Brain of Bug Exorcist
 
 An autonomous AI agent that analyzes runtime errors, generates fixes using GPT-4o,
 and orchestrates the entire bug fixing workflow including sandboxing and verification.
+
+Enhanced with automatic retry logic for failed fixes (max 3 attempts).
 """
 
 import asyncio
 import os
 from datetime import datetime
-from typing import AsyncGenerator, Dict, Optional, Any
+from typing import AsyncGenerator, Dict, Optional, Any, List
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -20,6 +22,7 @@ class BugExorcistAgent:
     2. Generates code fixes using GPT-4o
     3. Orchestrates Docker sandbox environments
     4. Verifies fixes before committing
+    5. Automatically retries up to 3 times if a fix fails
     """
 
     SYSTEM_PROMPT = """You are the Bug Exorcist, an elite autonomous AI debugging agent.
@@ -31,6 +34,7 @@ Your mission is to analyze runtime errors, understand their root causes, and gen
 - Understanding of common bug patterns (null pointer, type errors, logic errors, etc.)
 - Writing clean, production-ready fix patches
 - Explaining fixes in developer-friendly language
+- Learning from failed fix attempts to generate better solutions
 
 **Analysis Process:**
 1. Examine the error message and stack trace carefully
@@ -40,20 +44,37 @@ Your mission is to analyze runtime errors, understand their root causes, and gen
 5. Generate a minimal, targeted fix
 6. Explain your reasoning
 
+**Retry Logic:**
+When a fix fails verification, you will receive:
+- The original error
+- Your previous fix attempt
+- The new error that occurred
+- Attempt number (1-3)
+
+Use this information to:
+- Identify why the previous fix failed
+- Avoid repeating the same mistake
+- Generate a more robust solution
+- Consider edge cases missed in previous attempts
+
 **Fix Requirements:**
 - Fixes must be minimal and surgical - only change what's necessary
 - Preserve existing code style and patterns
 - Add defensive checks where appropriate
 - Include brief inline comments explaining critical fixes
 - Ensure backwards compatibility when possible
+- Learn from previous failed attempts
 
 **Output Format:**
 When asked to fix code, respond with:
 1. Root Cause Analysis (2-3 sentences)
 2. The complete fixed code
 3. Explanation of changes made
+4. (On retry) What was wrong with the previous attempt
 
 Be precise, be thorough, be the exorcist of bugs."""
+
+    MAX_RETRY_ATTEMPTS = 3  # Maximum number of fix attempts
 
     def __init__(self, bug_id: str, openai_api_key: Optional[str] = None):
         """
@@ -79,6 +100,9 @@ Be precise, be thorough, be the exorcist of bugs."""
             openai_api_key=self.api_key,
             max_tokens=2000
         )
+        
+        # Track retry history
+        self.retry_history: List[Dict[str, Any]] = []
         
         self.stages = [
             "Initializing sandbox environment...",
@@ -129,7 +153,8 @@ Be precise, be thorough, be the exorcist of bugs."""
         error_message: str, 
         code_snippet: str,
         file_path: Optional[str] = None,
-        additional_context: Optional[str] = None
+        additional_context: Optional[str] = None,
+        previous_attempts: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
         Core function: Analyze an error and generate a fix using GPT-4o.
@@ -139,6 +164,7 @@ Be precise, be thorough, be the exorcist of bugs."""
             code_snippet: The code that caused the error
             file_path: Optional file path for context
             additional_context: Optional additional context about the bug
+            previous_attempts: List of previous fix attempts that failed
             
         Returns:
             Dictionary containing:
@@ -146,7 +172,10 @@ Be precise, be thorough, be the exorcist of bugs."""
                 - fixed_code: The corrected code
                 - explanation: What was changed and why
                 - confidence: Confidence level (0.0-1.0)
+                - attempt_number: Which attempt this is (1-3)
         """
+        attempt_number = len(previous_attempts) + 1 if previous_attempts else 1
+        
         # Construct the analysis prompt
         user_prompt = f"""Analyze and fix this bug:
 
@@ -167,12 +196,36 @@ Be precise, be thorough, be the exorcist of bugs."""
         if additional_context:
             user_prompt += f"\n**Additional Context:**\n{additional_context}\n"
         
+        # Add retry context if this is not the first attempt
+        if previous_attempts:
+            user_prompt += f"\n**RETRY ATTEMPT #{attempt_number}**\n"
+            user_prompt += f"**Previous attempts have failed. Learn from these mistakes:**\n\n"
+            
+            for i, attempt in enumerate(previous_attempts, 1):
+                user_prompt += f"--- Attempt {i} ---\n"
+                user_prompt += f"**Fix Attempted:**\n```python\n{attempt['fixed_code']}\n```\n"
+                user_prompt += f"**Result:** {attempt['verification_result']}\n"
+                if attempt.get('new_error'):
+                    user_prompt += f"**New Error:** {attempt['new_error']}\n"
+                user_prompt += "\n"
+            
+            user_prompt += f"""
+**IMPORTANT:** 
+- Analyze why the previous fix(es) failed
+- Do NOT repeat the same approach
+- Generate a MORE ROBUST solution that addresses the failures
+- Consider edge cases that were missed
+"""
+        
         user_prompt += """
 Please provide:
 1. Root Cause Analysis
 2. The complete fixed code
 3. Explanation of your changes
 """
+        
+        if previous_attempts:
+            user_prompt += "4. What was wrong with the previous attempt(s) and how this fix is different\n"
         
         try:
             # Call GPT-4o via LangChain
@@ -184,7 +237,7 @@ Please provide:
             response = await self.llm.agenerate([messages])
             ai_response = response.generations[0][0].text
             
-            # Parse the AI response (in production, use structured output)
+            # Parse the AI response
             result = self._parse_ai_response(ai_response, code_snippet)
             
             return {
@@ -194,7 +247,9 @@ Please provide:
                 "explanation": result["explanation"],
                 "confidence": result["confidence"],
                 "original_error": error_message,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "attempt_number": attempt_number,
+                "retry_analysis": result.get("retry_analysis", "")
             }
             
         except Exception as e:
@@ -205,7 +260,8 @@ Please provide:
                 "fixed_code": code_snippet,
                 "explanation": f"Error during GPT-4o analysis: {str(e)}",
                 "confidence": 0.0,
-                "timestamp": datetime.now().isoformat()
+                "timestamp": datetime.now().isoformat(),
+                "attempt_number": attempt_number
             }
 
     def _parse_ai_response(self, ai_response: str, original_code: str) -> Dict[str, Any]:
@@ -215,12 +271,12 @@ Please provide:
         In production, this should use structured output or JSON mode.
         For now, it uses heuristic parsing.
         """
-        # Simple heuristic parsing
         lines = ai_response.split('\n')
         
         root_cause = ""
         fixed_code = ""
         explanation = ""
+        retry_analysis = ""
         in_code_block = False
         
         for i, line in enumerate(lines):
@@ -236,6 +292,8 @@ Please provide:
                 root_cause = '\n'.join(lines[i+1:i+4]).strip()
             elif 'explanation' in line.lower() or 'changes' in line.lower():
                 explanation = '\n'.join(lines[i+1:i+5]).strip()
+            elif 'wrong with' in line.lower() or 'previous attempt' in line.lower():
+                retry_analysis = '\n'.join(lines[i:i+4]).strip()
         
         # Fallback: if no code found, use original
         if not fixed_code.strip():
@@ -248,13 +306,15 @@ Please provide:
             "root_cause": root_cause or "Analysis completed",
             "fixed_code": fixed_code.strip(),
             "explanation": explanation or "Code has been fixed",
-            "confidence": confidence
+            "confidence": confidence,
+            "retry_analysis": retry_analysis
         }
 
     async def verify_fix(
         self, 
         fixed_code: str, 
-        test_command: Optional[str] = None
+        test_command: Optional[str] = None,
+        original_error: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Verify the fix by running tests in a Docker sandbox.
@@ -262,17 +322,146 @@ Please provide:
         Args:
             fixed_code: The patched code to test
             test_command: Optional test command to run
+            original_error: The original error for comparison
             
         Returns:
-            Dictionary with verification results
+            Dictionary with verification results including:
+                - verified: Boolean indicating if fix passed
+                - test_output: Output from the test
+                - exit_code: Exit code from test
+                - new_error: Any new error that occurred (if verification failed)
         """
-        # This would integrate with Docker SDK
-        # For now, return a mock verification
+        try:
+            # Import sandbox here to avoid circular imports
+            from app.sandbox import Sandbox
+            
+            sandbox = Sandbox()
+            
+            # Run the fixed code
+            result = sandbox.run_code(fixed_code)
+            
+            # Check if execution was successful
+            verified = not ("Error" in result or "Traceback" in result)
+            
+            return {
+                "verified": verified,
+                "test_output": result,
+                "exit_code": 0 if verified else 1,
+                "new_error": result if not verified else None,
+                "timestamp": datetime.now().isoformat()
+            }
+        except Exception as e:
+            return {
+                "verified": False,
+                "test_output": f"Verification error: {str(e)}",
+                "exit_code": 1,
+                "new_error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+
+    async def analyze_and_fix_with_retry(
+        self,
+        error_message: str,
+        code_snippet: str,
+        file_path: Optional[str] = None,
+        additional_context: Optional[str] = None,
+        max_attempts: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Analyze and fix a bug with automatic retry logic.
+        
+        This method will:
+        1. Attempt to fix the bug
+        2. Verify the fix in sandbox
+        3. If verification fails, retry up to MAX_RETRY_ATTEMPTS times
+        4. Each retry learns from previous failures
+        
+        Args:
+            error_message: The error to fix
+            code_snippet: Code containing the bug
+            file_path: Optional file path
+            additional_context: Optional additional context
+            max_attempts: Override default max attempts (default: 3)
+            
+        Returns:
+            Dictionary containing:
+                - success: Whether a working fix was found
+                - final_fix: The working fix result (if successful)
+                - all_attempts: List of all attempts made
+                - total_attempts: Number of attempts made
+        """
+        max_attempts = max_attempts or self.MAX_RETRY_ATTEMPTS
+        all_attempts = []
+        
+        for attempt_num in range(1, max_attempts + 1):
+            print(f"[AGENT] Attempt {attempt_num}/{max_attempts} - Analyzing bug...")
+            
+            # Generate fix (with context from previous attempts if any)
+            fix_result = await self.analyze_error(
+                error_message=error_message,
+                code_snippet=code_snippet,
+                file_path=file_path,
+                additional_context=additional_context,
+                previous_attempts=all_attempts
+            )
+            
+            print(f"[AGENT] Fix generated. Confidence: {fix_result['confidence']:.0%}")
+            print(f"[AGENT] Verifying fix in sandbox...")
+            
+            # Verify the fix
+            verification = await self.verify_fix(
+                fixed_code=fix_result['fixed_code'],
+                original_error=error_message
+            )
+            
+            # Record this attempt
+            attempt_record = {
+                "attempt_number": attempt_num,
+                "fix_result": fix_result,
+                "verification": verification,
+                "fixed_code": fix_result['fixed_code'],
+                "verification_result": "PASSED" if verification['verified'] else "FAILED",
+                "new_error": verification.get('new_error'),
+                "timestamp": datetime.now().isoformat()
+            }
+            all_attempts.append(attempt_record)
+            
+            # If fix is verified, we're done!
+            if verification['verified']:
+                print(f"[AGENT] ✅ Fix verified successfully on attempt {attempt_num}!")
+                return {
+                    "success": True,
+                    "final_fix": fix_result,
+                    "final_verification": verification,
+                    "all_attempts": all_attempts,
+                    "total_attempts": attempt_num,
+                    "message": f"Bug fixed successfully on attempt {attempt_num}"
+                }
+            else:
+                print(f"[AGENT] ❌ Fix failed verification. Error: {verification.get('new_error', 'Unknown')[:100]}...")
+                
+                # If this was the last attempt, return failure
+                if attempt_num == max_attempts:
+                    print(f"[AGENT] Maximum retry attempts ({max_attempts}) reached. Manual intervention required.")
+                    return {
+                        "success": False,
+                        "final_fix": None,
+                        "all_attempts": all_attempts,
+                        "total_attempts": attempt_num,
+                        "message": f"Failed to fix bug after {max_attempts} attempts. Manual review needed.",
+                        "last_error": verification.get('new_error')
+                    }
+                else:
+                    print(f"[AGENT] Retrying with improved approach...")
+                    # Continue to next iteration
+        
+        # This shouldn't be reached, but just in case
         return {
-            "verified": True,
-            "test_output": "All tests passed",
-            "exit_code": 0,
-            "timestamp": datetime.now().isoformat()
+            "success": False,
+            "final_fix": None,
+            "all_attempts": all_attempts,
+            "total_attempts": len(all_attempts),
+            "message": "Retry loop completed unexpectedly"
         }
 
     async def execute_full_workflow(
@@ -280,7 +469,8 @@ Please provide:
         error_message: str,
         code_snippet: str,
         file_path: str,
-        repo_path: Optional[str] = None
+        repo_path: Optional[str] = None,
+        use_retry: bool = True
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Execute the complete bug fixing workflow with real-time updates.
@@ -290,6 +480,7 @@ Please provide:
             code_snippet: Code containing the bug
             file_path: Path to the file
             repo_path: Optional repository path for git operations
+            use_retry: Whether to use automatic retry logic (default: True)
             
         Yields:
             Status updates throughout the workflow
@@ -300,55 +491,95 @@ Please provide:
             "timestamp": datetime.now().isoformat()
         }
         
-        # Stage 1: Analysis
-        yield {
-            "stage": "analysis",
-            "message": "Analyzing error with GPT-4o...",
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        fix_result = await self.analyze_error(error_message, code_snippet, file_path)
-        
-        yield {
-            "stage": "analysis_complete",
-            "message": f"Root cause identified: {fix_result['root_cause'][:100]}...",
-            "data": fix_result,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        # Stage 2: Verification
-        yield {
-            "stage": "verification",
-            "message": "Verifying fix in sandbox...",
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        verification = await self.verify_fix(fix_result['fixed_code'])
-        
-        yield {
-            "stage": "verification_complete",
-            "message": f"Verification: {'PASSED' if verification['verified'] else 'FAILED'}",
-            "data": verification,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        # Stage 3: Completion
-        if verification['verified']:
+        if use_retry:
+            # Use the retry-enabled workflow
             yield {
-                "stage": "complete",
-                "message": "Bug successfully exorcised! Fix ready for commit.",
-                "data": {
-                    "fix": fix_result,
-                    "verification": verification
-                },
+                "stage": "analysis",
+                "message": "Analyzing error with GPT-4o (retry logic enabled, max 3 attempts)...",
                 "timestamp": datetime.now().isoformat()
             }
+            
+            retry_result = await self.analyze_and_fix_with_retry(
+                error_message=error_message,
+                code_snippet=code_snippet,
+                file_path=file_path
+            )
+            
+            # Yield updates for each attempt
+            for attempt in retry_result['all_attempts']:
+                yield {
+                    "stage": f"attempt_{attempt['attempt_number']}",
+                    "message": f"Attempt {attempt['attempt_number']}: {attempt['verification_result']}",
+                    "data": attempt,
+                    "timestamp": attempt['timestamp']
+                }
+            
+            if retry_result['success']:
+                yield {
+                    "stage": "complete",
+                    "message": f"Bug successfully exorcised on attempt {retry_result['total_attempts']}!",
+                    "data": {
+                        "fix": retry_result['final_fix'],
+                        "verification": retry_result['final_verification'],
+                        "total_attempts": retry_result['total_attempts']
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                yield {
+                    "stage": "failed",
+                    "message": f"Failed after {retry_result['total_attempts']} attempts. {retry_result['message']}",
+                    "data": retry_result,
+                    "timestamp": datetime.now().isoformat()
+                }
         else:
+            # Original single-attempt workflow
             yield {
-                "stage": "failed",
-                "message": "Fix verification failed. Manual review required.",
+                "stage": "analysis",
+                "message": "Analyzing error with GPT-4o...",
                 "timestamp": datetime.now().isoformat()
             }
+            
+            fix_result = await self.analyze_error(error_message, code_snippet, file_path)
+            
+            yield {
+                "stage": "analysis_complete",
+                "message": f"Root cause identified: {fix_result['root_cause'][:100]}...",
+                "data": fix_result,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            yield {
+                "stage": "verification",
+                "message": "Verifying fix in sandbox...",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            verification = await self.verify_fix(fix_result['fixed_code'])
+            
+            yield {
+                "stage": "verification_complete",
+                "message": f"Verification: {'PASSED' if verification['verified'] else 'FAILED'}",
+                "data": verification,
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            if verification['verified']:
+                yield {
+                    "stage": "complete",
+                    "message": "Bug successfully exorcised! Fix ready for commit.",
+                    "data": {
+                        "fix": fix_result,
+                        "verification": verification
+                    },
+                    "timestamp": datetime.now().isoformat()
+                }
+            else:
+                yield {
+                    "stage": "failed",
+                    "message": "Fix verification failed. Manual review required.",
+                    "timestamp": datetime.now().isoformat()
+                }
 
 
 # Convenience function for quick usage
@@ -367,3 +598,31 @@ async def quick_fix(error: str, code: str, api_key: Optional[str] = None) -> str
     agent = BugExorcistAgent(bug_id="quick-fix", openai_api_key=api_key)
     result = await agent.analyze_error(error, code)
     return result['fixed_code']
+
+
+# Convenience function for retry-enabled fixing
+async def fix_with_retry(
+    error: str, 
+    code: str, 
+    api_key: Optional[str] = None,
+    max_attempts: int = 3
+) -> Dict[str, Any]:
+    """
+    Fix with automatic retry logic.
+    
+    Args:
+        error: Error message
+        code: Code with the bug
+        api_key: Optional OpenAI API key
+        max_attempts: Maximum retry attempts (default: 3)
+        
+    Returns:
+        Dictionary with fix results and retry information
+    """
+    agent = BugExorcistAgent(bug_id="retry-fix", openai_api_key=api_key)
+    result = await agent.analyze_and_fix_with_retry(
+        error_message=error,
+        code_snippet=code,
+        max_attempts=max_attempts
+    )
+    return result
