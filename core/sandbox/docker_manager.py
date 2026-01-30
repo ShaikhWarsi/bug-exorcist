@@ -1,7 +1,8 @@
 import docker
 import logging
 import uuid
-import os
+import threading
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,20 +20,24 @@ class DockerSandboxManager:
     def create_container(self, image="python:3.9-slim", memory_limit="128m"):
         """
         Spin up an isolated container to run unsafe code.
+        Changes for Security:
+        - read_only=True: Root filesystem is immutable (prevents persistence/rootkits).
+        - tmpfs: Writable temporary directory limited to 64MB (prevents disk fill attacks).
         """
         container_name = f"sandbox_{uuid.uuid4().hex}"
         try:
-            logger.info(f"Creating sandbox container: {container_name}")
+            logger.info(f"Creating secure sandbox container: {container_name}")
             container = self.client.containers.run(
                 image,
                 command="tail -f /dev/null",  # Keep container running
                 name=container_name,
                 mem_limit=memory_limit,
-                network_disabled=True,        # Isolate from network for security
+                network_disabled=True,        # Isolate from network
                 detach=True,
                 pids_limit=10,                # Prevent fork bombs
                 cpu_quota=50000,              # Limit CPU usage (50%)
-                read_only=False
+                read_only=True,               # [Security] Make root FS read-only
+                tmpfs={'/tmp': 'size=64m'}    # [Security] Limited writeable space
             )
             return container.id
         except Exception as e:
@@ -41,28 +46,59 @@ class DockerSandboxManager:
 
     def execute_code(self, container_id, code, timeout=5):
         """
-        Execute a Python script inside the container.
+        Execute a Python script inside the container securely.
+        Changes for Security:
+        - List-based command: Prevents shell injection.
+        - Threaded Timeout: Enforces strict execution time limits.
         """
         try:
             container = self.client.containers.get(container_id)
             
-            # Escape code safe for shell execution
-            safe_code = code.replace('"', '\\"').replace("'", "\\'")
-            command = f'python3 -c "{safe_code}"'
-
-            logger.info(f"Executing code in container {container_id}")
+            # [Security] Use list format to prevent Command Injection
+            # No need to manually escape quotes; Docker SDK handles arguments safely.
+            command = ["python3", "-c", code]
             
-            # Run the command with timeout handling
-            exec_result = container.exec_run(command, workdir="/tmp")
-            
-            output = exec_result.output.decode("utf-8")
-            exit_code = exec_result.exit_code
+            result_holder = {}
 
+            def run_exec():
+                try:
+                    # Execute in /tmp since root is read-only
+                    exec_result = container.exec_run(command, workdir="/tmp")
+                    result_holder['output'] = exec_result.output.decode("utf-8")
+                    result_holder['exit_code'] = exec_result.exit_code
+                except Exception as ex:
+                    result_holder['error'] = str(ex)
+
+            # [Security] Run execution in a separate thread to enforce timeout
+            exec_thread = threading.Thread(target=run_exec)
+            exec_thread.start()
+            exec_thread.join(timeout=timeout)
+
+            if exec_thread.is_alive():
+                logger.warning(f"Timeout detected for container {container_id}. Restarting to clear state.")
+                # If it's still running, the code is stuck (e.g., while True).
+                # We restart the container to kill the process reliably.
+                try:
+                    container.restart(timeout=0)
+                except Exception as restart_err:
+                    logger.error(f"Failed to restart container: {restart_err}")
+                
+                return {
+                    "output": "Error: Execution timed out.",
+                    "exit_code": 124, # Standard UNIX timeout exit code
+                    "status": "error"
+                }
+
+            if 'error' in result_holder:
+                return {"status": "error", "message": result_holder['error']}
+
+            exit_code = result_holder.get('exit_code', 1)
             return {
-                "output": output,
+                "output": result_holder.get('output', ''),
                 "exit_code": exit_code,
                 "status": "success" if exit_code == 0 else "error"
             }
+
         except docker.errors.NotFound:
             logger.error(f"Container {container_id} not found.")
             return {"status": "error", "message": "Container not found"}
@@ -84,20 +120,21 @@ class DockerSandboxManager:
             logger.error(f"Cleanup failed for {container_id}: {e}")
             return False
 
-# Example usage for testing (if run directly)
 if __name__ == "__main__":
+    # Quick test to verify changes locally
     manager = DockerSandboxManager()
-    
-    # 1. Create
     cid = manager.create_container()
     if cid:
-        print(f"Container Started: {cid}")
+        print(f"Started: {cid}")
         
-        # 2. Execute Unsafe Code
-        unsafe_code = "print('Hello from the secure sandbox!')"
-        result = manager.execute_code(cid, unsafe_code)
-        print("Execution Result:", result)
+        # Test 1: Normal Code
+        print("\nTest 1 (Normal):", manager.execute_code(cid, "print(sum(i for i in range(10)))"))
         
-        # 3. Cleanup
+        # Test 2: Timeout Loop (Should return timeout error)
+        print("\nTest 2 (Timeout):", manager.execute_code(cid, "while True: pass", timeout=2))
+        
+        # Test 3: File Write (Should work in /tmp)
+        code_file = "with open('/tmp/test.txt', 'w') as f: f.write('ok'); print('wrote file')"
+        print("\nTest 3 (Tmp Write):", manager.execute_code(cid, code_file))
+        
         manager.cleanup(cid)
-        print("Container Destroyed")
