@@ -100,23 +100,31 @@ export default function TerminalViewer({
 
                 // Update usage if available in result or thought
                 if (thoughtEvent.type === 'result' && thoughtEvent.data?.usage) {
-                    setUsage(thoughtEvent.data.usage);
+                    const finalUsage = thoughtEvent.data.usage;
+                    setUsage({
+                        ...finalUsage,
+                        estimated_cost: typeof finalUsage.estimated_cost === 'string' 
+                            ? finalUsage.estimated_cost 
+                            : (finalUsage.estimated_cost || 0).toFixed(6)
+                    });
                 } else if (thoughtEvent.type === 'thought' && thoughtEvent.data?.usage) {
                     setUsage(prev => {
                         const newUsage = thoughtEvent.data.usage;
-                        if (!prev) {
-                            return {
-                                ...newUsage,
-                                estimated_cost: typeof newUsage.estimated_cost === 'number' 
-                                    ? newUsage.estimated_cost.toFixed(6) 
-                                    : newUsage.estimated_cost
-                            };
-                        }
                         
-                        const prompt_tokens = prev.prompt_tokens + (newUsage.prompt_tokens || 0);
-                        const completion_tokens = prev.completion_tokens + (newUsage.completion_tokens || 0);
+                        // Robustly handle string vs number for current usage values
+                        const currentPrompt = prev?.prompt_tokens || 0;
+                        const currentCompletion = prev?.completion_tokens || 0;
+                        const currentCost = parseFloat(prev?.estimated_cost || "0");
+                        
+                        // Robustly handle string vs number for new incoming values
+                        const addPrompt = typeof newUsage.prompt_tokens === 'string' ? parseInt(newUsage.prompt_tokens, 10) : (newUsage.prompt_tokens || 0);
+                        const addCompletion = typeof newUsage.completion_tokens === 'string' ? parseInt(newUsage.completion_tokens, 10) : (newUsage.completion_tokens || 0);
+                        const addCost = typeof newUsage.estimated_cost === 'string' ? parseFloat(newUsage.estimated_cost) : (newUsage.estimated_cost || 0);
+                        
+                        const prompt_tokens = currentPrompt + addPrompt;
+                        const completion_tokens = currentCompletion + addCompletion;
                         const total_tokens = prompt_tokens + completion_tokens;
-                        const estimated_cost = (parseFloat(prev.estimated_cost) + (newUsage.estimated_cost || 0)).toFixed(6);
+                        const estimated_cost = (currentCost + addCost).toFixed(6);
                         
                         return {
                             prompt_tokens,
