@@ -2,9 +2,10 @@ import docker
 import tarfile
 import io
 import time
+from typing import Optional
 
 class Sandbox:
-    def __init__(self, image="python:3.9-slim"):
+    def __init__(self, image: str = "python:3.9-slim") -> None:
         self.client = docker.from_env()
         self.image = image
 

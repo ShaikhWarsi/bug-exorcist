@@ -7,7 +7,7 @@ Enhanced with automatic retry logic for failed fixes.
 
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Generator
 from sqlalchemy.orm import Session
 import os
 
@@ -88,7 +88,7 @@ class QuickFixResponse(BaseModel):
 
 
 # Dependency for database session
-def get_db():
+def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
@@ -97,7 +97,7 @@ def get_db():
 
 
 @router.post("/analyze", response_model=BugAnalysisResponse)
-async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)):
+async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)) -> BugAnalysisResponse:
     """
     Analyze a bug and generate a fix using GPT-4o.
     
@@ -205,7 +205,7 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
 
 
 @router.post("/fix-with-retry", response_model=RetryFixResponse)
-async def fix_bug_with_retry(request: RetryFixRequest, db: Session = Depends(get_db)):
+async def fix_bug_with_retry(request: RetryFixRequest, db: Session = Depends(get_db)) -> RetryFixResponse:
     """
     Analyze and fix a bug with automatic retry logic.
     
@@ -261,7 +261,7 @@ async def fix_bug_with_retry(request: RetryFixRequest, db: Session = Depends(get
 
 
 @router.post("/quick-fix", response_model=QuickFixResponse)
-async def quick_fix_endpoint(request: QuickFixRequest):
+async def quick_fix_endpoint(request: QuickFixRequest) -> QuickFixResponse:
     """
     Quick fix endpoint - returns only the fixed code without full analysis.
     
@@ -295,7 +295,7 @@ async def quick_fix_endpoint(request: QuickFixRequest):
 
 
 @router.get("/health")
-async def agent_health():
+async def agent_health() -> Dict[str, Any]:
     """
     Check if the agent system is operational.
     
@@ -340,7 +340,7 @@ async def agent_health():
 
 
 @router.get("/bugs/{bug_id}/status")
-async def get_bug_status(bug_id: int, db: Session = Depends(get_db)):
+async def get_bug_status(bug_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
     Get the status of a bug report.
     
@@ -365,7 +365,7 @@ async def get_bug_status(bug_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/bugs")
-async def list_bugs(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+async def list_bugs(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
     List all bug reports.
     
@@ -394,7 +394,7 @@ async def list_bugs(skip: int = 0, limit: int = 100, db: Session = Depends(get_d
 
 
 @router.post("/bugs/{bug_id}/verify")
-async def verify_bug_fix(bug_id: int, fixed_code: str, db: Session = Depends(get_db)):
+async def verify_bug_fix(bug_id: int, fixed_code: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     """
     Verify a bug fix by running it in a sandbox.
     
@@ -427,7 +427,7 @@ async def verify_bug_fix(bug_id: int, fixed_code: str, db: Session = Depends(get
 
 
 @router.post("/test-connection")
-async def test_openai_connection(api_key: Optional[str] = None):
+async def test_openai_connection(api_key: Optional[str] = None) -> Dict[str, Any]:
     """
     Test the OpenAI API connection.
     

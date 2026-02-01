@@ -1,11 +1,12 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.agent import BugExorcistAgent
 import asyncio
+from typing import None
 
 router = APIRouter()
 
 @router.websocket("/ws/logs/{bug_id}")
-async def websocket_endpoint(websocket: WebSocket, bug_id: str):
+async def websocket_endpoint(websocket: WebSocket, bug_id: str) -> None:
     await websocket.accept()
     agent = BugExorcistAgent(bug_id)
     try:
