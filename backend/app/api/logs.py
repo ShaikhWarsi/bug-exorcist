@@ -5,7 +5,7 @@ import asyncio
 router = APIRouter()
 
 @router.websocket("/ws/logs/{bug_id}")
-async def websocket_endpoint(websocket: WebSocket, bug_id: str):
+async def websocket_endpoint(websocket: WebSocket, bug_id: str) -> None:
     await websocket.accept()
     agent = BugExorcistAgent(bug_id)
     try:

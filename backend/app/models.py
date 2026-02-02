@@ -1,6 +1,10 @@
 from sqlalchemy import Column, Integer, String, DateTime
 from sqlalchemy.sql import func
+from typing import TYPE_CHECKING
 from .database import Base
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 class BugReport(Base):
     __tablename__ = "bug_reports"
