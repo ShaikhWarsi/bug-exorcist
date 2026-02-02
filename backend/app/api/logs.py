@@ -1,7 +1,6 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from core.agent import BugExorcistAgent
 import asyncio
-from typing import None
 
 router = APIRouter()
 

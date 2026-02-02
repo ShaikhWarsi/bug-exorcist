@@ -87,6 +87,54 @@ class QuickFixResponse(BaseModel):
     fixed_code: str
 
 
+class BugStatusResponse(BaseModel):
+    """Response model for bug status"""
+    id: int
+    description: str
+    status: str
+    created_at: str
+
+
+class BugListResponse(BaseModel):
+    """Response model for bug list"""
+    bugs: List[BugStatusResponse]
+    count: int
+
+
+class VerificationResponse(BaseModel):
+    """Response model for bug fix verification"""
+    verified: bool
+    output: Optional[str] = None
+    error: Optional[str] = None
+    execution_time: Optional[float] = None
+
+
+class ConnectionTestResponse(BaseModel):
+    """Response model for OpenAI connection test"""
+    success: bool
+    message: Optional[str] = None
+    model: Optional[str] = None
+    test_confidence: Optional[float] = None
+    retry_enabled: Optional[bool] = None
+    error: Optional[str] = None
+
+
+class AgentHealthResponse(BaseModel):
+    """Response model for agent health check"""
+    status: str
+    agent: str
+    primary_model: str
+    fallback_model: Optional[str] = None
+    api_key_configured: bool
+    gemini_key_configured: bool = False
+    gemini_fallback_enabled: bool = False
+    gemini_fallback_available: bool = False
+    langchain_available: bool
+    capabilities: List[str]
+    retry_config: Dict[str, Any]
+    ai_fallback_chain: List[str]
+
+
 # Dependency for database session
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
@@ -294,8 +342,8 @@ async def quick_fix_endpoint(request: QuickFixRequest) -> QuickFixResponse:
         raise HTTPException(status_code=500, detail=f"Quick fix failed: {str(e)}")
 
 
-@router.get("/health")
-async def agent_health() -> Dict[str, Any]:
+@router.get("/health", response_model=AgentHealthResponse)
+async def agent_health() -> AgentHealthResponse:
     """
     Check if the agent system is operational.
     
@@ -309,63 +357,70 @@ async def agent_health() -> Dict[str, Any]:
     gemini_enabled = is_gemini_enabled()
     gemini_available = is_gemini_available()
     
-    return {
-        "status": "operational",
-        "agent": "Bug Exorcist",
-        "primary_model": "gpt-4o",
-        "fallback_model": "gemini-1.5-pro" if gemini_available else None,
-        "api_key_configured": api_key_set,
-        "gemini_key_configured": gemini_key_set,
-        "gemini_fallback_enabled": gemini_enabled,
-        "gemini_fallback_available": gemini_available,
-        "langchain_available": True,
-        "capabilities": [
+    return AgentHealthResponse(
+        status="operational",
+        agent="Bug Exorcist",
+        primary_model="gpt-4o",
+        fallback_model="gemini-1.5-pro" if gemini_available else None,
+        api_key_configured=api_key_set,
+        gemini_key_configured=gemini_key_set,
+        gemini_fallback_enabled=gemini_enabled,
+        gemini_fallback_available=gemini_available,
+        langchain_available=True,
+        capabilities=[
             "error_analysis",
             "code_fixing",
             "root_cause_detection",
             "automated_verification",
             "automatic_retry_logic",
-            "multi_ai_fallback"  # NEW
+            "multi_ai_fallback"
         ],
-        "retry_config": {
+        retry_config={
             "enabled": True,
             "default_max_attempts": 3,
             "max_allowed_attempts": 5
         },
-        "ai_fallback_chain": [
+        ai_fallback_chain=[
             "gpt-4o (primary)",
             "gemini-1.5-pro (fallback)" if gemini_available else "manual guidance (fallback)"
         ]
-    }
+    )
 
 
-@router.get("/bugs/{bug_id}/status")
-async def get_bug_status(bug_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
+@router.get("/bugs/{bug_id}/status", response_model=BugStatusResponse)
+async def get_bug_status(bug_id: str, db: Session = Depends(get_db)) -> BugStatusResponse:
     """
     Get the status of a bug report.
     
     Args:
-        bug_id: ID of the bug report
+        bug_id: ID of the bug report (format: "BUG-{numeric_id}")
         db: Database session
         
     Returns:
         Bug report details
     """
-    bug_report = crud.get_bug_report(db, bug_id)
+    # Parse numeric ID from "BUG-{id}" format
+    if bug_id.startswith("BUG-"):
+        numeric_id = int(bug_id.replace("BUG-", ""))
+    else:
+        # If no prefix, try to parse as int directly
+        numeric_id = int(bug_id)
+    
+    bug_report = crud.get_bug_report(db, numeric_id)
     
     if not bug_report:
         raise HTTPException(status_code=404, detail="Bug not found")
     
-    return {
-        "id": bug_report.id,
-        "description": bug_report.description,
-        "status": bug_report.status,
-        "created_at": bug_report.created_at.isoformat()
-    }
+    return BugStatusResponse(
+        id=bug_report.id,
+        description=bug_report.description,
+        status=bug_report.status,
+        created_at=bug_report.created_at.isoformat()
+    )
 
 
-@router.get("/bugs")
-async def list_bugs(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)) -> Dict[str, Any]:
+@router.get("/bugs", response_model=BugListResponse)
+async def list_bugs(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)) -> BugListResponse:
     """
     List all bug reports.
     
@@ -379,22 +434,24 @@ async def list_bugs(skip: int = 0, limit: int = 100, db: Session = Depends(get_d
     """
     bugs = crud.get_bug_reports(db, skip=skip, limit=limit)
     
-    return {
-        "bugs": [
-            {
-                "id": bug.id,
-                "description": bug.description,
-                "status": bug.status,
-                "created_at": bug.created_at.isoformat()
-            }
-            for bug in bugs
-        ],
-        "count": len(bugs)
-    }
+    bug_responses = [
+        BugStatusResponse(
+            id=bug.id,
+            description=bug.description,
+            status=bug.status,
+            created_at=bug.created_at.isoformat()
+        )
+        for bug in bugs
+    ]
+    
+    return BugListResponse(
+        bugs=bug_responses,
+        count=len(bug_responses)
+    )
 
 
-@router.post("/bugs/{bug_id}/verify")
-async def verify_bug_fix(bug_id: int, fixed_code: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
+@router.post("/bugs/{bug_id}/verify", response_model=VerificationResponse)
+async def verify_bug_fix(bug_id: str, fixed_code: str, db: Session = Depends(get_db)) -> VerificationResponse:
     """
     Verify a bug fix by running it in a sandbox.
     
@@ -406,7 +463,13 @@ async def verify_bug_fix(bug_id: int, fixed_code: str, db: Session = Depends(get
     Returns:
         Verification results
     """
-    bug_report = crud.get_bug_report(db, bug_id)
+    # Parse numeric ID from "BUG-{id}" format
+    if bug_id.startswith("BUG-"):
+        numeric_id = int(bug_id.replace("BUG-", ""))
+    else:
+        numeric_id = int(bug_id)
+    
+    bug_report = crud.get_bug_report(db, numeric_id)
     
     if not bug_report:
         raise HTTPException(status_code=404, detail="Bug not found")
@@ -419,15 +482,15 @@ async def verify_bug_fix(bug_id: int, fixed_code: str, db: Session = Depends(get
     
     # Update status if verified
     if verification['verified']:
-        crud.update_bug_report_status(db=db, bug_report_id=bug_id, status="verified")
+        crud.update_bug_report_status(db=db, bug_report_id=bug_report.id, status="verified")
     else:
-        crud.update_bug_report_status(db=db, bug_report_id=bug_id, status="verification_failed")
+        crud.update_bug_report_status(db=db, bug_report_id=bug_report.id, status="verification_failed")
     
-    return verification
+    return VerificationResponse(**verification)
 
 
-@router.post("/test-connection")
-async def test_openai_connection(api_key: Optional[str] = None) -> Dict[str, Any]:
+@router.post("/test-connection", response_model=ConnectionTestResponse)
+async def test_openai_connection(api_key: Optional[str] = None) -> ConnectionTestResponse:
     """
     Test the OpenAI API connection.
     
@@ -440,10 +503,10 @@ async def test_openai_connection(api_key: Optional[str] = None) -> Dict[str, Any
     test_key = api_key or os.getenv("OPENAI_API_KEY")
     
     if not test_key:
-        return {
-            "success": False,
-            "error": "No API key provided"
-        }
+        return ConnectionTestResponse(
+            success=False,
+            error="No API key provided"
+        )
     
     try:
         # Simple test with a minimal agent
@@ -455,16 +518,16 @@ async def test_openai_connection(api_key: Optional[str] = None) -> Dict[str, Any
             code_snippet="print('test')"
         )
         
-        return {
-            "success": True,
-            "message": "OpenAI connection successful",
-            "model": "gpt-4o",
-            "test_confidence": test_result.get('confidence', 0.0),
-            "retry_enabled": True
-        }
+        return ConnectionTestResponse(
+            success=True,
+            message="OpenAI connection successful",
+            model="gpt-4o",
+            test_confidence=test_result.get('confidence', 0.0),
+            retry_enabled=True
+        )
         
     except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return ConnectionTestResponse(
+            success=False,
+            error=str(e)
+        )
