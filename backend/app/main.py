@@ -6,6 +6,7 @@ Enhanced with Bug Exorcist Agent integration and WebSocket streaming.
 
 import os
 import json
+from typing import Dict, Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +30,7 @@ app = FastAPI(
 
 # Health check endpoint
 @app.get("/health")
-def health_check():
+def health_check() -> Dict[str, Any]:
     return {
         "status": "active",
         "service": "Bug Exorcist",
@@ -64,7 +65,7 @@ app.include_router(agent_router, tags=["agent"])
 
 # NEW: Real-Time Thought Stream WebSocket Endpoint
 @app.websocket("/ws/thought-stream/{session_id}")
-async def thought_stream_websocket(websocket: WebSocket, session_id: str):
+async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> None:
     """
     WebSocket endpoint for real-time AI thought streaming.
     
@@ -220,7 +221,7 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str):
 
 
 @app.get("/")
-async def root():
+async def root() -> Dict[str, Any]:
     return {
         "message": "🧟‍♂️ Bug Exorcist API is running",
         "documentation": "/docs",
@@ -235,7 +236,7 @@ async def root():
     }
 
 @app.on_event("startup")
-async def startup_event():
+async def startup_event() -> None:
     """Run on application startup"""
     print("🧟‍♂️ Bug Exorcist API Starting...")
     print("=" * 60)
@@ -247,6 +248,6 @@ async def startup_event():
     print("=" * 60)
 
 @app.on_event("shutdown")
-async def shutdown_event():
+async def shutdown_event() -> None:
     """Run on application shutdown"""
     print("🧟‍♂️ Bug Exorcist API shutting down...")
