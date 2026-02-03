@@ -10,6 +10,9 @@ from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List, Generator
 from sqlalchemy.orm import Session
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 from core.agent import BugExorcistAgent, quick_fix, fix_with_retry
 from app.database import SessionLocal
@@ -53,6 +56,7 @@ class BugAnalysisResponse(BaseModel):
     original_error: str
     timestamp: str
     attempt_number: Optional[int] = 1
+    usage: Optional[Dict[str, Any]] = None
 
 
 class RetryFixRequest(BaseModel):
@@ -153,34 +157,8 @@ def get_db() -> Generator[Session, None, None]:
 async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)) -> BugAnalysisResponse:
     """
     Analyze a bug and generate a fix using GPT-4o.
-    
-    This endpoint now supports automatic retry logic:
-    - If use_retry=True (default), will automatically retry up to max_attempts times
-    - Each retry learns from previous failures
-    - Returns the first successful fix
-    
-    This endpoint:
-    1. Creates a bug report in the database
-    2. Analyzes the error using the Bug Exorcist agent
-    3. Verifies the fix in sandbox
-    4. Retries automatically if verification fails (up to max_attempts)
-    5. Returns the working fix or details of all attempts
-    
-    Args:
-        request: Bug analysis request with error details
-        db: Database session
-        
-    Returns:
-        Analysis results with fixed code (from successful attempt)
     """
     try:
-        # Create bug report in database
-        bug_report = crud.create_bug_report(
-            db=db,
-            description=f"{request.error_message[:200]}..."
-        )
-        bug_id = f"BUG-{bug_report.id}"
-        
         # Get API key (from request or environment)
         api_key = request.openai_api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -188,6 +166,18 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
                 status_code=400,
                 detail="OpenAI API key is required. Provide it in the request or set OPENAI_API_KEY environment variable."
             )
+
+        # Create bug report in database
+        bug_report = crud.create_bug_report(
+            db=db,
+            description=f"{request.error_message[:200]}..."
+        )
+        bug_id = f"BUG-{bug_report.id}"
+        
+        # Create a session for tracking usage
+        import uuid
+        session_id = str(uuid.uuid4())
+        crud.create_session(db=db, session_id=session_id, bug_report_id=bug_report.id)
         
         # Initialize agent
         agent = BugExorcistAgent(bug_id=bug_id, openai_api_key=api_key)
@@ -200,6 +190,27 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
                 file_path=request.file_path,
                 additional_context=request.additional_context,
                 max_attempts=request.max_attempts
+            )
+            
+            # Accumulate usage from all attempts
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+            total_cost = 0.0
+            
+            for attempt in retry_result.get('all_attempts', []):
+                fix_res = attempt.get('fix_result', {})
+                usage = fix_res.get('usage', {})
+                total_prompt_tokens += usage.get('prompt_tokens', 0)
+                total_completion_tokens += usage.get('completion_tokens', 0)
+                total_cost += usage.get('estimated_cost', 0.0)
+            
+            # Update session usage in DB
+            crud.update_session_usage(
+                db=db, 
+                session_id=session_id, 
+                prompt_tokens=total_prompt_tokens, 
+                completion_tokens=total_completion_tokens, 
+                estimated_cost=total_cost
             )
             
             # Update bug report status based on result
@@ -215,7 +226,14 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
                     confidence=final_fix['confidence'],
                     original_error=request.error_message,
                     timestamp=final_fix['timestamp'],
-                    attempt_number=retry_result['total_attempts']
+                    attempt_number=retry_result['total_attempts'],
+                    usage={
+                        "prompt_tokens": total_prompt_tokens,
+                        "completion_tokens": total_completion_tokens,
+                        "total_tokens": total_prompt_tokens + total_completion_tokens,
+                        "estimated_cost": f"{total_cost:.6f}",
+                        "session_id": session_id
+                    }
                 )
             else:
                 crud.update_bug_report_status(db=db, bug_report_id=bug_report.id, status="failed")
@@ -232,10 +250,10 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
                         }
                     )
                 else:
+                    logger.error(f"Analysis failed for {bug_id} after {retry_result['total_attempts']} attempts. Last error: {retry_result.get('last_error', 'Unknown')}")
                     raise HTTPException(
                         status_code=500,
-                        detail=f"Failed to fix bug after {retry_result['total_attempts']} attempts. "
-                               f"Last error: {retry_result.get('last_error', 'Unknown')}"
+                        detail="Analysis failed: Maximum retry attempts reached without a valid fix."
                     )
         else:
             # Single attempt (original behavior)
@@ -246,15 +264,38 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
                 additional_context=request.additional_context
             )
             
+            # Update session usage in DB
+            usage = result.get('usage', {})
+            crud.update_session_usage(
+                db=db, 
+                session_id=session_id, 
+                prompt_tokens=usage.get('prompt_tokens', 0), 
+                completion_tokens=usage.get('completion_tokens', 0), 
+                estimated_cost=usage.get('estimated_cost', 0.0)
+            )
+            
             # Update bug report status
             crud.update_bug_report_status(db=db, bug_report_id=bug_report.id, status="analyzed")
             
-            return BugAnalysisResponse(**result)
+            return BugAnalysisResponse(
+                bug_id=bug_id,
+                root_cause=result['root_cause'],
+                fixed_code=result['fixed_code'],
+                explanation=result['explanation'],
+                confidence=result['confidence'],
+                original_error=request.error_message,
+                timestamp=result['timestamp'],
+                usage={
+                    **usage,
+                    "session_id": session_id
+                }
+            )
         
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+        logger.exception(f"Unexpected error during analysis for {bug_id if 'bug_id' in locals() else 'unknown session'}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred during bug analysis. Please try again.")
 
 
 @router.post("/fix-with-retry", response_model=RetryFixResponse)
@@ -310,7 +351,8 @@ async def fix_bug_with_retry(request: RetryFixRequest, db: Session = Depends(get
         return RetryFixResponse(**result)
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Retry fix failed: {str(e)}")
+        logger.exception(f"Retry fix failed for {bug_id if 'bug_id' in locals() else 'unknown'}")
+        raise HTTPException(status_code=500, detail="Retry fix process failed. Please check server logs.")
 
 
 @router.post("/quick-fix", response_model=QuickFixResponse)
@@ -344,7 +386,8 @@ async def quick_fix_endpoint(request: QuickFixRequest) -> QuickFixResponse:
         return QuickFixResponse(fixed_code=fixed)
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Quick fix failed: {str(e)}")
+        logger.exception("Quick fix failed")
+        raise HTTPException(status_code=500, detail="Quick fix failed. Please check server logs.")
 
 
 @router.get("/health", response_model=AgentHealthResponse)
