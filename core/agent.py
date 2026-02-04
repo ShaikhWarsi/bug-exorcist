@@ -757,6 +757,7 @@ Please provide:
     def _parse_ai_response(self, ai_response: str, original_code: str) -> Dict[str, Any]:
         """
         Parse AI's response to extract structured components using a state machine.
+        Handles inline content in headers and code fences.
         """
         lines = ai_response.split('\n')
         
@@ -769,28 +770,64 @@ Please provide:
         current_state = None
         
         for line in lines:
-            lower_line = line.lower().strip()
+            stripped_line = line.strip()
+            lower_line = stripped_line.lower()
             
             # State transitions
             if '```' in lower_line:
                 if current_state != 'code':
                     current_state = 'code'
-                    if 'python' not in lower_line:
-                        continue # Skip the ``` line itself
+                    # Check for inline code after the fence: ```python print("hello")
+                    fence_content = stripped_line.split('```', 1)[1]
+                    # Remove language identifier if present
+                    if fence_content.startswith('python'):
+                        fence_content = fence_content[6:].strip()
+                    else:
+                        # Common case: ```python\ncode...
+                        # If there's content after the language ID on the same line, keep it
+                        parts = fence_content.split(None, 1)
+                        if len(parts) > 1:
+                            fence_content = parts[1].strip()
+                        else:
+                            fence_content = ""
+                    
+                    if fence_content:
+                        fixed_code_lines.append(fence_content)
+                    continue 
                 else:
+                    # Closing fence. Check for inline code before the fence: print("done")```
+                    fence_prefix = stripped_line.split('```', 1)[0].strip()
+                    if fence_prefix:
+                        fixed_code_lines.append(fence_prefix)
                     current_state = None
                     continue
-            elif 'root cause' in lower_line:
+            
+            # Check for section headers with potential inline content
+            header_found = False
+            if 'root cause' in lower_line:
                 current_state = 'root_cause'
-                continue
+                header_found = True
+                content = stripped_line.split(':', 1)[1].strip() if ':' in stripped_line else ""
             elif 'explanation' in lower_line or 'changes' in lower_line:
                 current_state = 'explanation'
-                continue
+                header_found = True
+                content = stripped_line.split(':', 1)[1].strip() if ':' in stripped_line else ""
             elif 'wrong with' in lower_line or 'previous attempt' in lower_line:
                 current_state = 'retry_analysis'
+                header_found = True
+                content = stripped_line.split(':', 1)[1].strip() if ':' in stripped_line else ""
+            
+            if header_found:
+                if content:
+                    if current_state == 'root_cause':
+                        root_cause_lines.append(content)
+                    elif current_state == 'explanation':
+                        explanation_lines.append(content)
+                    elif current_state == 'retry_analysis':
+                        retry_analysis_lines.append(content)
                 continue
             
-            # State actions
+            # State actions for non-header lines
             if current_state == 'root_cause':
                 root_cause_lines.append(line)
             elif current_state == 'code':
