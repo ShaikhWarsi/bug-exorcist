@@ -162,6 +162,7 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
         additional_context = request_data.get("additional_context")
         use_retry = request_data.get("use_retry", True)
         max_attempts = request_data.get("max_attempts", 3)
+        language = request_data.get("language", "python")
         
         # Validate required fields
         if not error_message or not code_snippet:
@@ -206,21 +207,17 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
             crud.create_session(db=db, session_id=session_id, bug_report_id=bug_report.id)
             
             # Initialize agent with streaming capability
-            # Note: API keys are now handled inside the agent based on configuration
             agent = BugExorcistAgent(bug_id=bug_id)
             
-            # Stream the thought process
-            total_prompt_tokens = 0
-            total_completion_tokens = 0
-            total_cost = 0.0
-            
+            # Start thought stream
             async for event in agent.stream_thought_process(
                 error_message=error_message,
                 code_snippet=code_snippet,
                 file_path=file_path,
                 additional_context=additional_context,
                 use_retry=use_retry,
-                max_attempts=max_attempts
+                max_attempts=max_attempts,
+                language=language
             ):
                 # If this is a thought event with usage, accumulate it
                 if event.get("type") == "thought" and "usage" in event.get("data", {}):
