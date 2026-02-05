@@ -9,8 +9,43 @@ import json
 import logging
 import re
 import datetime
-from typing import Dict, Any, List
+import asyncio
+from typing import Dict, Any, List, Optional
+from pathlib import Path
 from dotenv import load_dotenv
+
+# Path validation helper
+def validate_paths(repo_path: Optional[str], file_path: Optional[str] = None) -> bool:
+    """
+    Validates that repo_path and file_path are safe and authorized.
+    """
+    if not repo_path:
+        return True # repo_path is optional for some flows
+        
+    try:
+        repo_dir = Path(repo_path).resolve()
+        
+        # Check if it's a directory
+        if not repo_dir.is_dir():
+            return False
+            
+        # Optional: Restrict to a specific root if defined in env
+        allowed_root = os.getenv("ALLOWED_REPO_ROOT")
+        if allowed_root:
+            root_dir = Path(allowed_root).resolve()
+            if root_dir not in repo_dir.parents and root_dir != repo_dir:
+                return False
+        
+        if file_path:
+            # Join and resolve to catch traversal
+            target_file = (repo_dir / file_path).resolve()
+            # Check if target_file is within repo_dir
+            if repo_dir not in target_file.parents and repo_dir != target_file:
+                return False
+                
+        return True
+    except Exception:
+        return False
 
 # NEW: Structured JSON Logging Formatter
 class JsonFormatter(logging.Formatter):
@@ -64,12 +99,46 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.logs import router as logs_router
 from app.api.agent import router as agent_router
 from app.database import engine, Base
+from sqlalchemy import text
 
 # Load environment variables from .env file
 load_dotenv()
 
+def run_migrations():
+    """Lightweight startup migration routine to add missing columns to sessions table."""
+    logger.info("Checking for database migrations...")
+    try:
+        with engine.connect() as conn:
+            # Check existing columns in sessions table
+            result = conn.execute(text("PRAGMA table_info(sessions)"))
+            columns = [row[1] for row in result.fetchall()]
+            
+            # Add missing columns if they don't exist
+            if "is_approved" not in columns:
+                logger.info("Adding 'is_approved' column to sessions table")
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN is_approved INTEGER DEFAULT 0"))
+            
+            if "fixed_code" not in columns:
+                logger.info("Adding 'fixed_code' column to sessions table")
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN fixed_code TEXT"))
+            
+            if "repo_path" not in columns:
+                logger.info("Adding 'repo_path' column to sessions table")
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN repo_path TEXT"))
+                
+            if "file_path" not in columns:
+                logger.info("Adding 'file_path' column to sessions table")
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN file_path TEXT"))
+            
+            conn.commit()
+            logger.info("Database migrations completed successfully")
+    except Exception as e:
+        logger.error(f"Error during database migration: {e}")
+
 # Create database tables
 Base.metadata.create_all(bind=engine)
+# Run custom migrations for existing tables
+run_migrations()
 
 app = FastAPI(
     title="Bug Exorcist API",
@@ -185,6 +254,18 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
         code_snippet = request_data.get("code_snippet", "")
         file_path = request_data.get("file_path")
         repo_path = request_data.get("repo_path") # Optional: used for git operations
+        
+        # Security: Validate paths to prevent traversal
+        if not validate_paths(repo_path, file_path):
+            await websocket.send_json({
+                "type": "error",
+                "timestamp": __import__('datetime').datetime.now().isoformat(),
+                "message": "Invalid or unauthorized repository/file path.",
+                "stage": "initialization"
+            })
+            await websocket.close()
+            return
+
         additional_context = request_data.get("additional_context")
         use_retry = request_data.get("use_retry", True)
         max_attempts = request_data.get("max_attempts", 3)
@@ -294,8 +375,9 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
                             import difflib
                             original_content = ""
                             if repo_path and file_path:
-                                full_path = os.path.join(repo_path, file_path)
-                                if os.path.exists(full_path):
+                                # Construct full path safely
+                                full_path = (Path(repo_path) / file_path).resolve()
+                                if full_path.exists() and validate_paths(repo_path, file_path):
                                     with open(full_path, 'r', encoding='utf-8') as f:
                                         original_content = f.read()
                             
@@ -335,42 +417,60 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
                         }
                     })
                     
-                    # Wait for approval/rejection
-                    approval_data = await websocket.receive_json()
-                    if approval_data.get("action") == "approve":
-                        await websocket.send_json({
-                            "type": "status",
-                            "timestamp": __import__('datetime').datetime.now().isoformat(),
-                            "message": "✅ Fix approved. Applying to repository...",
-                            "stage": "applying_fix"
-                        })
-                        
-                        # Apply Git fix if repo_path is provided
-                        if repo_path and file_path and final_fix_code:
-                            from app.git_ops import apply_fix_to_repo
-                            git_res = apply_fix_to_repo(
-                                repo_path=repo_path,
-                                bug_id=bug_id,
-                                file_path=file_path,
-                                fixed_code=final_fix_code
-                            )
+                    # Wait for approval/rejection with timeout and disconnect handling
+                    try:
+                        approval_data = await asyncio.wait_for(websocket.receive_json(), timeout=60)
+                        if approval_data.get("action") == "approve":
                             await websocket.send_json({
-                                "type": "thought",
+                                "type": "status",
                                 "timestamp": __import__('datetime').datetime.now().isoformat(),
-                                "message": git_res,
+                                "message": "✅ Fix approved. Applying to repository...",
                                 "stage": "applying_fix"
                             })
-                        
-                        crud.update_session_approval(db=db, session_id=session_id, is_approved=1)
-                    else:
+                            
+                            # Apply Git fix if repo_path is provided and valid
+                            if repo_path and file_path and final_fix_code and validate_paths(repo_path, file_path):
+                                from app.git_ops import apply_fix_to_repo
+                                git_res = apply_fix_to_repo(
+                                    repo_path=repo_path,
+                                    bug_id=bug_id,
+                                    file_path=file_path,
+                                    fixed_code=final_fix_code
+                                )
+                                await websocket.send_json({
+                                    "type": "thought",
+                                    "timestamp": __import__('datetime').datetime.now().isoformat(),
+                                    "message": git_res,
+                                    "stage": "applying_fix"
+                                })
+                            
+                            crud.update_session_approval(db=db, session_id=session_id, is_approved=1)
+                        else:
+                            await websocket.send_json({
+                                "type": "status",
+                                "timestamp": __import__('datetime').datetime.now().isoformat(),
+                                "message": "❌ Fix rejected by user.",
+                                "stage": "rejected"
+                            })
+                            crud.update_session_approval(db=db, session_id=session_id, is_approved=-1)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Approval request timed out for session {session_id}")
+                        crud.update_session_approval(db=db, session_id=session_id, is_approved=-1)
                         await websocket.send_json({
-                            "type": "status",
+                            "type": "error",
                             "timestamp": __import__('datetime').datetime.now().isoformat(),
-                            "message": "❌ Fix rejected by user.",
+                            "message": "Approval request timed out (60s limit). Fix rejected.",
                             "stage": "rejected"
                         })
+                        break
+                    except WebSocketDisconnect:
+                        logger.info(f"Client disconnected during approval for session {session_id}")
                         crud.update_session_approval(db=db, session_id=session_id, is_approved=-1)
-                        # We could optionally continue analysis here, but for now we stop
+                        return # Exit the function immediately
+                    except Exception as e:
+                        logger.error(f"Error during approval process: {e}")
+                        crud.update_session_approval(db=db, session_id=session_id, is_approved=-1)
+                        break
             
             # Update bug status in database based on final result
             # (This would be determined by the last event)

@@ -116,10 +116,15 @@ Be systematic, thorough, and learn from failures."""
 
     def _init_provider(self, agent_type: str, api_key: Optional[str] = None) -> Any:
         """Initialize a specific AI provider based on type."""
+        # Check if MockLLM is explicitly enabled via environment flag
+        allow_mock = os.getenv("ALLOW_MOCK_LLM", "false").lower() == "true"
+
         if agent_type == "gpt-4o":
             key = api_key or os.getenv("OPENAI_API_KEY")
             if not key:
-                return MockLLM("mock-gpt-4o")
+                if allow_mock:
+                    return MockLLM("mock-gpt-4o")
+                raise ValueError("OPENAI_API_KEY is not configured and ALLOW_MOCK_LLM is false")
             return ChatOpenAI(
                 model="gpt-4o",
                 temperature=0.2,
@@ -131,13 +136,19 @@ Be systematic, thorough, and learn from failures."""
                 from core.gemini_agent import GeminiFallbackAgent
                 gemini = GeminiFallbackAgent()
                 return gemini.llm
-            return MockLLM("mock-gemini")
+            if allow_mock:
+                return MockLLM("mock-gemini")
+            raise ValueError("Gemini provider is not available (check GOOGLE_API_KEY) and ALLOW_MOCK_LLM is false")
         elif agent_type == "ollama":
             if is_ollama_available():
                 return get_ollama_llm()
-            return MockLLM("mock-ollama")
+            if allow_mock:
+                return MockLLM("mock-ollama")
+            raise ValueError("Ollama provider is not available and ALLOW_MOCK_LLM is false")
         
-        return MockLLM("mock-default")
+        if allow_mock:
+            return MockLLM("mock-default")
+        raise ValueError(f"Unknown agent type '{agent_type}' and ALLOW_MOCK_LLM is false")
 
     async def _execute_retry_logic(
         self,
@@ -447,8 +458,14 @@ Be systematic, thorough, and learn from failures."""
                 
                 async def on_verification_complete(attempt_num: int, verification: Dict[str, Any], verified: bool):
                     """Called after verification completes"""
+                    error_msg = verification.get('new_error', 'Unknown error')
+                    # Sanitize error message to avoid leaking internal details/tracebacks
+                    display_error = error_msg.split('\n')[0] if error_msg else "Unknown error"
+                    if len(display_error) > 100:
+                        display_error = display_error[:97] + "..."
+                        
                     return emit_status(
-                        f"✅ Fix verified successfully on attempt {attempt_num}!" if verified else f"❌ Verification failed: {verification.get('new_error', 'Unknown error')[:100]}",
+                        f"✅ Fix verified successfully on attempt {attempt_num}!" if verified else f"❌ Verification failed: {display_error}",
                         "complete" if verified else "verification",
                         {"verified": verified, "attempt": attempt_num}
                     )
@@ -608,26 +625,6 @@ Be systematic, thorough, and learn from failures."""
         """
         Analyze an error and generate a fix using AI.
         """
-        # Centralized analysis logic
-        if hasattr(self, "primary_provider") and isinstance(self.primary_provider, MockLLM):
-            # Return a controlled mock response that will pass verification
-            return {
-                "ai_agent": "mock-ai",
-                "root_cause": "Division by zero.",
-                "fixed_code": "def divide(a, b):\n    if b == 0: return 0\n    return a / b",
-                "explanation": "Added check for zero.",
-                "confidence": 0.95,
-                "original_error": error_message,
-                "timestamp": datetime.now().isoformat(),
-                "attempt_number": len(previous_attempts or []) + 1,
-                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "estimated_cost": 0.0, "model": "mock-ai"}
-            }
-
-        # Sanitize language for prompt safety
-        safe_language = re.sub(r'[^a-zA-Z0-9\-]', '', language).strip() or "python"
-        
-        attempt_number = len(previous_attempts) + 1 if previous_attempts else 1
-        
         # Determine which provider to use
         provider = self.secondary_provider if use_secondary else self.primary_provider
         
@@ -638,6 +635,27 @@ Be systematic, thorough, and learn from failures."""
         if provider is None:
             raise ValueError("No AI providers are configured")
 
+        # Centralized analysis logic for MockLLM
+        if isinstance(provider, MockLLM):
+            # Return a controlled mock response that will pass verification
+            return {
+                "ai_agent": provider.model_name,
+                "provider_mode": "mock",
+                "root_cause": "Division by zero.",
+                "fixed_code": "def divide(a, b):\n    if b == 0: return 0\n    return a / b",
+                "explanation": "Added check for zero.",
+                "confidence": 0.95,
+                "original_error": error_message,
+                "timestamp": datetime.now().isoformat(),
+                "attempt_number": len(previous_attempts or []) + 1,
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "estimated_cost": 0.0, "model": provider.model_name}
+            }
+
+        # Sanitize language for prompt safety
+        safe_language = re.sub(r'[^a-zA-Z0-9\-]', '', language).strip() or "python"
+        
+        attempt_number = len(previous_attempts) + 1 if previous_attempts else 1
+        
         # All analysis logic is now centralized here
         # Construct the analysis prompt
         user_prompt = f"""Analyze and fix this bug:
@@ -730,6 +748,7 @@ Please provide:
             
             return {
                 "ai_agent": model_name,
+                "provider_mode": "real",
                 "root_cause": result["root_cause"],
                 "fixed_code": result["fixed_code"],
                 "explanation": result["explanation"],
@@ -878,24 +897,44 @@ Please provide:
         language: str = "python"
     ) -> Dict[str, Any]:
         """Verify the fix in the sandbox."""
-        if hasattr(self, "sandbox") and hasattr(self.sandbox, "use_mock") and self.sandbox.use_mock:
-            # For testing purposes, let's say it's verified
-            return {"verified": True, "output": "Mock verification passed."}
-        
-        # Real verification logic
-        from app.sandbox import Sandbox
-        sandbox = Sandbox()
-        result = sandbox.run_code(fixed_code, language)
+        # Real verification logic with robust exception handling
+        try:
+            from app.sandbox import Sandbox
+            sandbox = Sandbox()
+            result = sandbox.run_code(fixed_code, language)
+            
+            # Check if Mock Sandbox is being used
+            if getattr(sandbox, "use_mock", False):
+                allow_mock_sandbox = os.getenv("ALLOW_MOCK_SANDBOX_VERIFICATION", "false").lower() == "true"
+                if not allow_mock_sandbox:
+                    return {
+                        "verified": False,
+                        "output": "Sandbox unavailable: Docker not reachable and mock verification is disabled.",
+                        "new_error": "Sandbox unavailable: Docker not reachable",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                # If mock is allowed, treat as verified for testing
+                return {
+                    "verified": True, 
+                    "output": "Mock verification passed (Docker not available).", 
+                    "new_error": None, 
+                    "timestamp": datetime.now().isoformat()
+                }
+        except Exception as e:
+            # Handle sandbox initialization/execution errors gracefully
+            error_type = type(e).__name__
+            error_details = str(e)
+            return {
+                "verified": False,
+                "output": f"Sandbox error ({error_type}): {error_details}",
+                "new_error": f"Verification system error: {error_type}",
+                "timestamp": datetime.now().isoformat()
+            }
         
         # Check if original error is gone
         verified = True
         new_error = None
         
-        # In mock mode, if the sandbox is actually mocked but we reach here,
-        # we should ensure it returns True for the test to proceed
-        if "Mock execution successful" in result:
-            return {"verified": True, "output": result, "new_error": None, "timestamp": datetime.now().isoformat()}
-
         if original_error and original_error in result:
             verified = False
             new_error = f"Original error persists: {original_error}"

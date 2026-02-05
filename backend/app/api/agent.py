@@ -576,14 +576,24 @@ async def test_agent_connection(api_key: Optional[str] = None) -> ConnectionTest
         # Simple test with a minimal agent
         agent = BugExorcistAgent(bug_id="test", openai_api_key=api_key)
         
-        # Validate that the primary provider is actually configured
-        # This prevents false-positives where the agent might fallback to a secondary provider
+        # Validate that the primary provider is actually configured and NOT a MockLLM
+        # This prevents false-positives where the agent might fallback to a secondary provider or MockLLM
+        primary_agent = os.getenv("PRIMARY_AGENT", "gpt-4o")
+        
+        from core.agent import MockLLM
+        
         if agent.primary_provider is None:
-            primary_agent = os.getenv("PRIMARY_AGENT", "gpt-4o")
             return ConnectionTestResponse(
                 success=False,
                 message=f"Primary provider '{primary_agent}' is not configured or missing API key.",
                 error="Configuration Error"
+            )
+        elif isinstance(agent.primary_provider, MockLLM):
+            return ConnectionTestResponse(
+                success=False,
+                message=f"Primary provider '{primary_agent}' is running in MOCK mode. Configure API keys for real analysis.",
+                error="Mock Mode Enabled",
+                model=agent.primary_provider.model_name
             )
             
         # Try a simple analysis

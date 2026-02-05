@@ -1,6 +1,7 @@
 import git
 import os
 from typing import Optional
+from pathlib import Path
 
 def apply_fix_to_repo(
     repo_path: str, bug_id: str, file_path: str, fixed_code: str
@@ -9,6 +10,15 @@ def apply_fix_to_repo(
     Applies a fix to the repository by creating a new branch, updating the file, and committing.
     """
     try:
+        # Validate paths internally as a second line of defense
+        repo_dir = Path(repo_path).resolve()
+        if not repo_dir.is_dir():
+            return f"Error: {repo_path} is not a valid directory"
+            
+        target_file = (repo_dir / file_path).resolve()
+        if repo_dir not in target_file.parents and repo_dir != target_file:
+            return f"Error: Path traversal detected in {file_path}"
+
         repo = git.Repo(repo_path)
         
     
@@ -23,8 +33,8 @@ def apply_fix_to_repo(
             current = repo.create_head(branch_name)
             current.checkout()
             
-        # Full path to the file
-        full_file_path = os.path.join(repo_path, file_path)
+        # Full path to the file (already validated above)
+        full_file_path = str(target_file)
         
         # Ensure directory exists
         os.makedirs(os.path.dirname(full_file_path), exist_ok=True)

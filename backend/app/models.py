@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy import Column, Integer, String, DateTime, Text
 from sqlalchemy.sql import func
 from typing import TYPE_CHECKING
 from .database import Base
@@ -26,6 +26,6 @@ class Session(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     is_approved = Column(Integer, default=0) # 0: pending, 1: approved, -1: rejected
-    fixed_code = Column(String, nullable=True)
+    fixed_code = Column(Text, nullable=True)
     repo_path = Column(String, nullable=True)
     file_path = Column(String, nullable=True)
