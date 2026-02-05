@@ -5,7 +5,7 @@ import time
 from typing import Optional
 
 class Sandbox:
-    def __init__(self, image: str = "python:3.9-slim") -> None:
+    def __init__(self, image: str = "bug-exorcist-sandbox:latest") -> None:
         self.client = docker.from_env()
         self.image = image
 
@@ -21,10 +21,26 @@ class Sandbox:
             # 0.5 CPU Limit (500,000,000 nano cpus)
             nano_cpus = 500_000_000
             
+            # Map language to execution command
+            # Using /bin/sh -c to support shell features like &&, pipes, and redirects
+            commands = {
+                "python": ["/bin/sh", "-c", "python3 -c \"import sys; exec(sys.stdin.read())\""],
+                "javascript": ["/bin/sh", "-c", "node -e \"$(cat)\""],
+                "nodejs": ["/bin/sh", "-c", "node -e \"$(cat)\""],
+                "go": ["/bin/sh", "-c", "cat > main.go && go run main.go"],
+                "go-test": ["/bin/sh", "-c", "cat > main_test.go && go test -v"],
+                "rust": ["/bin/sh", "-c", "cat > main.rs && rustc main.rs -o main && ./main"],
+                "cargo-test": ["/bin/sh", "-c", "cargo test"],
+                "npm-test": ["/bin/sh", "-c", "cat > test.js && npm test -- --test-file=test.js"],
+                "bash": ["/bin/bash", "-c", "$(cat)"]
+            }
+            
+            command = commands.get(language.lower(), commands["python"])
+
             # Create the container with restrictions
             container = self.client.containers.run(
                 self.image,
-                command="python -c \"import sys; exec(sys.stdin.read())\"",
+                command=command,
                 stdin_open=True,
                 detach=True,
                 # Security restrictions

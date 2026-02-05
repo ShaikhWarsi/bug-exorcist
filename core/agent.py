@@ -13,6 +13,7 @@ to eliminate duplication between analyze_and_fix_with_retry and stream_thought_p
 """
 
 import os
+import re
 from datetime import datetime
 from typing import Dict, Optional, Any, List, AsyncGenerator, Callable, Awaitable
 from langchain_openai import ChatOpenAI
@@ -133,6 +134,7 @@ Be systematic, thorough, and learn from failures."""
         file_path: Optional[str] = None,
         additional_context: Optional[str] = None,
         max_attempts: int = 3,
+        language: str = "python",
         on_attempt_start: Optional[Callable[[int, str, bool], Awaitable[None]]] = None,
         on_fix_generated: Optional[Callable[[int, Dict[str, Any]], Awaitable[None]]] = None,
         on_verification_complete: Optional[Callable[[int, Dict[str, Any], bool], Awaitable[None]]] = None,
@@ -177,7 +179,8 @@ Be systematic, thorough, and learn from failures."""
                     file_path=file_path,
                     additional_context=additional_context,
                     previous_attempts=all_attempts,
-                    use_secondary=use_secondary
+                    use_secondary=use_secondary,
+                    language=language
                 )
                 
                 # Notify: fix generated
@@ -187,7 +190,8 @@ Be systematic, thorough, and learn from failures."""
                 # Verify the fix
                 verification = await self.verify_fix(
                     fixed_code=fix_result['fixed_code'],
-                    original_error=error_message
+                    original_error=error_message,
+                    language=language
                 )
                 
                 # Record attempt
@@ -275,7 +279,8 @@ Be systematic, thorough, and learn from failures."""
         code_snippet: str,
         file_path: Optional[str] = None,
         additional_context: Optional[str] = None,
-        max_attempts: int = 3
+        max_attempts: int = 3,
+        language: str = "python"
     ) -> Dict[str, Any]:
         """
         Analyze and fix a bug with automatic retry logic (REST API interface).
@@ -289,6 +294,7 @@ Be systematic, thorough, and learn from failures."""
             file_path: Optional path to the file containing the bug
             additional_context: Optional additional context about the bug
             max_attempts: Maximum retry attempts (default: 3, max: 5)
+            language: The programming language of the code (default: "python")
             
         Returns:
             Dictionary containing detailed results of all attempts:
@@ -304,7 +310,8 @@ Be systematic, thorough, and learn from failures."""
             code_snippet=code_snippet,
             file_path=file_path,
             additional_context=additional_context,
-            max_attempts=min(max_attempts, 5)
+            max_attempts=min(max_attempts, 5),
+            language=language
             # No callbacks - REST endpoint doesn't need streaming
         )
 
@@ -315,7 +322,8 @@ Be systematic, thorough, and learn from failures."""
         file_path: Optional[str] = None,
         additional_context: Optional[str] = None,
         use_retry: bool = True,
-        max_attempts: int = 3
+        max_attempts: int = 3,
+        language: str = "python"
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Stream the agent's thought process in real-time (WebSocket interface).
@@ -484,6 +492,7 @@ Be systematic, thorough, and learn from failures."""
                     file_path=file_path,
                     additional_context=additional_context,
                     max_attempts=max_attempts,
+                    language=language,
                     on_attempt_start=on_attempt_start,
                     on_fix_generated=on_fix_generated,
                     on_verification_complete=on_verification_complete,
@@ -556,7 +565,8 @@ Be systematic, thorough, and learn from failures."""
                     error_message=error_message,
                     code_snippet=code_snippet,
                     file_path=file_path,
-                    additional_context=additional_context
+                    additional_context=additional_context,
+                    language=language
                 )
                 
                 yield emit_status(
@@ -569,7 +579,10 @@ Be systematic, thorough, and learn from failures."""
                     "verification"
                 )
                 
-                verification = await self.verify_fix(fix_result['fixed_code'])
+                verification = await self.verify_fix(
+                    fixed_code=fix_result['fixed_code'],
+                    language=language
+                )
                 
                 if verification['verified']:
                     yield emit_status(
@@ -610,11 +623,15 @@ Be systematic, thorough, and learn from failures."""
         file_path: Optional[str] = None,
         additional_context: Optional[str] = None,
         previous_attempts: Optional[List[Dict[str, Any]]] = None,
-        use_secondary: bool = False
+        use_secondary: bool = False,
+        language: str = "python"
     ) -> Dict[str, Any]:
         """
         Analyze an error and generate a fix using AI.
         """
+        # Sanitize language for prompt safety
+        safe_language = re.sub(r'[^a-zA-Z0-9\-]', '', language).strip() or "python"
+        
         attempt_number = len(previous_attempts) + 1 if previous_attempts else 1
         
         # Determine which provider to use
@@ -631,13 +648,15 @@ Be systematic, thorough, and learn from failures."""
         # Construct the analysis prompt
         user_prompt = f"""Analyze and fix this bug:
 
+**Language:** {safe_language}
+
 **Error Message:**
 ```
 {error_message}
 ```
 
 **Original Code:**
-```python
+```{safe_language}
 {code_snippet}
 ```
 """
@@ -655,7 +674,7 @@ Be systematic, thorough, and learn from failures."""
             
             for i, attempt in enumerate(previous_attempts, 1):
                 user_prompt += f"--- Attempt {i} ---\n"
-                user_prompt += f"**Fix Attempted:**\n```python\n{attempt['fixed_code']}\n```\n"
+                user_prompt += f"**Fix Attempted:**\n```{language}\n{attempt['fixed_code']}\n```\n"
                 user_prompt += f"**Result:** {attempt['verification_result']}\n"
                 if attempt.get('new_error'):
                     user_prompt += f"**New Error:** {attempt['new_error']}\n"
@@ -748,7 +767,8 @@ Please provide:
                     file_path=file_path,
                     additional_context=additional_context,
                     previous_attempts=previous_attempts,
-                    use_secondary=True
+                    use_secondary=True,
+                    language=language
                 )
             
             # Provide a user-friendly error message without leaking internal details
@@ -860,7 +880,8 @@ Please provide:
     async def verify_fix(
         self,
         fixed_code: str,
-        original_error: Optional[str] = None
+        original_error: Optional[str] = None,
+        language: str = "python"
     ) -> Dict[str, Any]:
         """
         Verify a fix by running it in the sandbox.
@@ -868,12 +889,13 @@ Please provide:
         Args:
             fixed_code: The fixed code to verify
             original_error: Optional original error for comparison
+            language: The programming language of the code
             
         Returns:
             Dictionary containing verification results
         """
         try:
-            result = self.sandbox.run_code(fixed_code)
+            result = self.sandbox.run_code(fixed_code, language=language)
             
             # Check if execution was successful
             verified = not result.startswith("Error")
@@ -898,7 +920,8 @@ Please provide:
         error_message: str,
         code_snippet: str,
         file_path: Optional[str] = None,
-        additional_context: Optional[str] = None
+        additional_context: Optional[str] = None,
+        language: str = "python"
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Execute the full bug fixing workflow with status updates.
@@ -915,7 +938,8 @@ Please provide:
             file_path=file_path,
             additional_context=additional_context,
             use_retry=True,
-            max_attempts=3
+            max_attempts=3,
+            language=language
         ):
             yield event
 
@@ -934,20 +958,21 @@ Please provide:
 
 
 # Convenience functions for quick usage
-async def quick_fix(error: str, code: str, api_key: Optional[str] = None) -> str:
+async def quick_fix(error: str, code: str, language: str = "python", api_key: Optional[str] = None) -> str:
     """
     Quick fix - returns only the fixed code without full analysis.
     
     Args:
         error: Error message
         code: Problematic code
+        language: The programming language of the code
         api_key: Optional OpenAI API key
         
     Returns:
         Fixed code as string
     """
     agent = BugExorcistAgent(bug_id="quick-fix", openai_api_key=api_key)
-    result = await agent.analyze_error(error, code)
+    result = await agent.analyze_error(error, code, language=language)
     return result['fixed_code']
 
 
@@ -955,6 +980,7 @@ async def fix_with_retry(
     error: str,
     code: str,
     max_attempts: int = 3,
+    language: str = "python",
     api_key: Optional[str] = None
 ) -> Dict[str, Any]:
     """
@@ -964,6 +990,7 @@ async def fix_with_retry(
         error: Error message
         code: Problematic code
         max_attempts: Maximum retry attempts
+        language: The programming language of the code
         api_key: Optional OpenAI API key
         
     Returns:
@@ -973,5 +1000,6 @@ async def fix_with_retry(
     return await agent.analyze_and_fix_with_retry(
         error_message=error,
         code_snippet=code,
-        max_attempts=max_attempts
+        max_attempts=max_attempts,
+        language=language
     )
