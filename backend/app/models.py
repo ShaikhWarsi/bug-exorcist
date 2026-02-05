@@ -25,3 +25,7 @@ class Session(Base):
     estimated_cost = Column(String, default="0.00")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    is_approved = Column(Integer, default=0) # 0: pending, 1: approved, -1: rejected
+    fixed_code = Column(String, nullable=True)
+    repo_path = Column(String, nullable=True)
+    file_path = Column(String, nullable=True)

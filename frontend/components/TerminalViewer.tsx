@@ -3,7 +3,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 
 interface ThoughtEvent {
-    type: 'thought' | 'status' | 'result' | 'error';
+    type: 'thought' | 'status' | 'result' | 'error' | 'APPROVAL_REQUEST';
     timestamp: string;
     message: string;
     stage: string;
@@ -43,6 +43,7 @@ export default function TerminalViewer({
         estimated_cost: "0.0000"
     });
     const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
+    const [awaitingApproval, setAwaitingApproval] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
@@ -139,6 +140,12 @@ export default function TerminalViewer({
                 if (thoughtEvent.type === 'result' || thoughtEvent.type === 'error') {
                     setIsProcessing(false);
                 }
+
+                // Handle approval request
+                if (thoughtEvent.stage === 'awaiting_approval') {
+                    setAwaitingApproval(true);
+                    setIsProcessing(false);
+                }
             } catch (error) {
                 console.error('Failed to parse thought event:', error);
             }
@@ -211,6 +218,8 @@ export default function TerminalViewer({
         switch (thought.type) {
             case 'status':
                 return '🔵';
+            case 'APPROVAL_REQUEST':
+                return '✋';
             case 'thought':
                 if (thought.message.includes('✅')) return '✅';
                 if (thought.message.includes('❌')) return '❌';
@@ -230,6 +239,8 @@ export default function TerminalViewer({
         switch (thought.type) {
             case 'status':
                 return 'text-blue-400';
+            case 'APPROVAL_REQUEST':
+                return 'text-yellow-400 font-bold';
             case 'thought':
                 if (thought.message.includes('✅')) return 'text-green-400';
                 if (thought.message.includes('❌')) return 'text-red-400';
@@ -255,6 +266,21 @@ export default function TerminalViewer({
 
     const clearThoughts = () => {
         setThoughts([]);
+    };
+
+    const handleApprove = () => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ action: 'approve' }));
+            setAwaitingApproval(false);
+            setIsProcessing(true);
+        }
+    };
+
+    const handleReject = () => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ action: 'reject' }));
+            setAwaitingApproval(false);
+        }
     };
 
     return (
@@ -369,14 +395,28 @@ export default function TerminalViewer({
                                     {thought.message}
                                 </p>
                                 {thought.data && Object.keys(thought.data).length > 0 && (
-                                    <details className="mt-1 text-[#38ff14]/50 text-[10px]">
-                                        <summary className="cursor-pointer hover:text-[#38ff14]/70 uppercase tracking-wider">
-                                            View Details
-                                        </summary>
-                                        <pre className="mt-2 p-2 bg-black/40 rounded border border-[#2a3a27] overflow-x-auto text-[#38ff14]/70">
-                                            {JSON.stringify(thought.data, null, 2)}
-                                        </pre>
-                                    </details>
+                                    <div className="mt-2">
+                                        {thought.type === 'APPROVAL_REQUEST' && thought.data.patch ? (
+                                            <div className="bg-black/60 rounded border border-yellow-500/30 overflow-hidden">
+                                                <div className="bg-yellow-500/10 px-3 py-1 border-b border-yellow-500/30 flex justify-between items-center">
+                                                    <span className="text-yellow-400 text-[10px] uppercase tracking-widest font-bold">Proposed Patch</span>
+                                                    <span className="text-yellow-400/50 text-[10px] font-mono">{thought.data.file_path}</span>
+                                                </div>
+                                                <pre className="p-3 text-[11px] overflow-x-auto text-[#38ff14]/90 font-mono leading-relaxed max-h-60 overflow-y-auto">
+                                                    {thought.data.patch}
+                                                </pre>
+                                            </div>
+                                        ) : (
+                                            <details className="text-[#38ff14]/50 text-[10px]">
+                                                <summary className="cursor-pointer hover:text-[#38ff14]/70 uppercase tracking-wider">
+                                                    View Details
+                                                </summary>
+                                                <pre className="mt-2 p-2 bg-black/40 rounded border border-[#2a3a27] overflow-x-auto text-[#38ff14]/70">
+                                                    {JSON.stringify(thought.data, null, 2)}
+                                                </pre>
+                                            </details>
+                                        )}
+                                    </div>
                                 )}
                             </div>
                         </div>
@@ -399,6 +439,28 @@ export default function TerminalViewer({
             </div>
 
             {/* Terminal Footer */}
+            {awaitingApproval && (
+                <div className="p-4 bg-[#38ff14]/10 border-t border-[#38ff14]/20 flex items-center justify-between animate-pulse">
+                    <div className="flex items-center gap-3">
+                        <span className="material-symbols-outlined text-[#38ff14]">pan_tool</span>
+                        <span className="text-[#38ff14] text-sm font-bold uppercase tracking-wider">Awaiting your approval to apply the fix</span>
+                    </div>
+                    <div className="flex gap-3">
+                        <button
+                            onClick={handleReject}
+                            className="px-6 py-2 bg-red-500/20 border border-red-500/50 rounded-lg text-red-400 text-xs font-bold uppercase tracking-widest hover:bg-red-500/40 transition-all"
+                        >
+                            Reject
+                        </button>
+                        <button
+                            onClick={handleApprove}
+                            className="px-6 py-2 bg-[#38ff14]/20 border border-[#38ff14]/50 rounded-lg text-[#38ff14] text-xs font-bold uppercase tracking-widest hover:bg-[#38ff14]/40 transition-all shadow-[0_0_15px_#38ff1444]"
+                        >
+                            Approve & Apply
+                        </button>
+                    </div>
+                </div>
+            )}
             <div className="h-8 border-t border-[#2a3a27] bg-black/60 flex items-center justify-between px-4 text-[10px] font-mono shrink-0">
                 <div className="flex gap-4 text-[#38ff14]/40 uppercase tracking-widest">
                     <span>Session: {sessionId?.slice(0, 8) || 'N/A'}</span>

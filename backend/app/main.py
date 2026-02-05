@@ -184,10 +184,12 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
         error_message = request_data.get("error_message", "")
         code_snippet = request_data.get("code_snippet", "")
         file_path = request_data.get("file_path")
+        repo_path = request_data.get("repo_path") # Optional: used for git operations
         additional_context = request_data.get("additional_context")
         use_retry = request_data.get("use_retry", True)
         max_attempts = request_data.get("max_attempts", 3)
         language = sanitize_language(request_data.get("language", "python"))
+        require_approval = os.getenv("REQUIRE_APPROVAL", "false").lower() == "true"
         
         # Validate required fields
         if not error_message or not code_snippet:
@@ -240,6 +242,7 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
             agent = BugExorcistAgent(bug_id=bug_id)
             
             # Start thought stream
+            last_result = None
             async for event in agent.stream_thought_process(
                 error_message=error_message,
                 code_snippet=code_snippet,
@@ -249,6 +252,8 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
                 max_attempts=max_attempts,
                 language=language
             ):
+                if event.get("type") == "result":
+                    last_result = event.get("data")
                 # If this is a thought event with usage, accumulate it
                 if event.get("type") == "thought" and "usage" in event.get("data", {}):
                     usage = event["data"]["usage"]
@@ -277,6 +282,95 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
                 
                 # Send each thought event to the client
                 await websocket.send_json(event)
+                
+                # Check if we need approval before concluding
+                if require_approval and event.get("type") == "result" and event.get("data", {}).get("success"):
+                    final_fix_code = event.get("data", {}).get("fixed_code")
+                    
+                    if final_fix_code:
+                        # Generate diff for the approval request
+                        patch = ""
+                        try:
+                            import difflib
+                            original_content = ""
+                            if repo_path and file_path:
+                                full_path = os.path.join(repo_path, file_path)
+                                if os.path.exists(full_path):
+                                    with open(full_path, 'r', encoding='utf-8') as f:
+                                        original_content = f.read()
+                            
+                            if not original_content and code_snippet:
+                                original_content = code_snippet
+                                
+                            diff = difflib.unified_diff(
+                                original_content.splitlines(keepends=True),
+                                final_fix_code.splitlines(keepends=True),
+                                fromfile=f'a/{file_path or "original"}',
+                                tofile=f'b/{file_path or "fixed"}'
+                            )
+                            patch = "".join(diff)
+                        except Exception as e:
+                            logger.error(f"Failed to generate diff: {e}")
+                            patch = f"Could not generate diff. Previewing fixed code:\n\n{final_fix_code}"
+
+                        crud.update_session_approval(
+                            db=db, 
+                            session_id=session_id, 
+                            is_approved=0, 
+                            fixed_code=final_fix_code,
+                            repo_path=repo_path,
+                            file_path=file_path
+                        )
+
+                    await websocket.send_json({
+                        "type": "APPROVAL_REQUEST",
+                        "timestamp": __import__('datetime').datetime.now().isoformat(),
+                        "message": "✋ Fix generated. Awaiting user approval before applying.",
+                        "stage": "awaiting_approval",
+                        "data": {
+                            "require_approval": True,
+                            "fixed_code": final_fix_code,
+                            "patch": patch,
+                            "file_path": file_path
+                        }
+                    })
+                    
+                    # Wait for approval/rejection
+                    approval_data = await websocket.receive_json()
+                    if approval_data.get("action") == "approve":
+                        await websocket.send_json({
+                            "type": "status",
+                            "timestamp": __import__('datetime').datetime.now().isoformat(),
+                            "message": "✅ Fix approved. Applying to repository...",
+                            "stage": "applying_fix"
+                        })
+                        
+                        # Apply Git fix if repo_path is provided
+                        if repo_path and file_path and final_fix_code:
+                            from app.git_ops import apply_fix_to_repo
+                            git_res = apply_fix_to_repo(
+                                repo_path=repo_path,
+                                bug_id=bug_id,
+                                file_path=file_path,
+                                fixed_code=final_fix_code
+                            )
+                            await websocket.send_json({
+                                "type": "thought",
+                                "timestamp": __import__('datetime').datetime.now().isoformat(),
+                                "message": git_res,
+                                "stage": "applying_fix"
+                            })
+                        
+                        crud.update_session_approval(db=db, session_id=session_id, is_approved=1)
+                    else:
+                        await websocket.send_json({
+                            "type": "status",
+                            "timestamp": __import__('datetime').datetime.now().isoformat(),
+                            "message": "❌ Fix rejected by user.",
+                            "stage": "rejected"
+                        })
+                        crud.update_session_approval(db=db, session_id=session_id, is_approved=-1)
+                        # We could optionally continue analysis here, but for now we stop
             
             # Update bug status in database based on final result
             # (This would be determined by the last event)

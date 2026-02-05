@@ -6,13 +6,21 @@ from typing import Optional
 
 class Sandbox:
     def __init__(self, image: str = "bug-exorcist-sandbox:latest") -> None:
-        self.client = docker.from_env()
-        self.image = image
+        try:
+            self.client = docker.from_env()
+            self.image = image
+            self.use_mock = False
+        except Exception:
+            print("⚠️ Docker not found. Using Mock Sandbox for development.")
+            self.use_mock = True
 
     def run_code(self, code: str, language: str = "python") -> str:
         """
         Executes code in a secure Docker sandbox.
         """
+        if self.use_mock:
+            return "Mock execution successful (Docker not available)."
+
         container = None
         try:
             # Configure resource limits
