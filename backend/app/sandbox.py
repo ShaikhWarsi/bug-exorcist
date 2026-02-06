@@ -5,6 +5,7 @@ import time
 import os
 import logging
 import yaml
+import asyncio
 from datetime import datetime
 from typing import Optional, Dict, List, Any, AsyncGenerator
 from .sandbox_utils import SandboxManifest, detect_project_type, generate_dynamic_dockerfile
@@ -18,6 +19,7 @@ class Sandbox:
         self.sidecar_containers = []
         self.network = None
         self.session_id = f"exorcist-{int(time.time())}"
+        self.image = image
         
         # Load manifest
         manifest_path = os.path.join(project_path, ".exorcist.yaml")
@@ -95,6 +97,8 @@ print(f"DISK_FREE:{usage.free // (2**20)}MB")
                 diagnostics["env"][k] = v
                 
         return diagnostics
+
+    async def build_image(self, log_callback: Optional[Any] = None) -> str:
         """
         Dynamically builds a Docker image based on project dependencies and manifest.
         Uses hashing for intelligent caching of built images.
