@@ -14,15 +14,32 @@ logger = logging.getLogger(__name__)
 
 class Sandbox:
     def __init__(self, project_path: str = ".", image: str = "bug-exorcist-sandbox:latest") -> None:
-        self.project_path = project_path
+        # Resolve and validate project_path immediately to prevent traversal
+        try:
+            from pathlib import Path
+            resolved_path = Path(project_path).resolve()
+            if not resolved_path.is_dir():
+                raise ValueError(f"Project path is not a directory: {project_path}")
+            
+            allowed_root = os.getenv("ALLOWED_REPO_ROOT")
+            if allowed_root:
+                root_dir = Path(allowed_root).resolve()
+                if root_dir not in resolved_path.parents and root_dir != resolved_path:
+                    raise ValueError(f"Access denied to project path: {project_path}")
+            
+            self.project_path = str(resolved_path)
+        except Exception as e:
+            logger.error(f"Sandbox initialization failed: {e}")
+            self.project_path = os.getcwd() # Fallback to current dir for safety
+            
         self.use_mock = False
         self.sidecar_containers = []
         self.network = None
         self.session_id = f"exorcist-{int(time.time())}"
         self.image = image
         
-        # Load manifest
-        manifest_path = os.path.join(project_path, ".exorcist.yaml")
+        # Load manifest from validated path
+        manifest_path = os.path.join(self.project_path, ".exorcist.yaml")
         self.manifest = SandboxManifest.from_yaml(manifest_path)
 
         try:
@@ -35,12 +52,19 @@ class Sandbox:
             self.use_mock = True
 
     def _create_network(self):
-        """Creates a dedicated bridge network for this sandbox session."""
+        """Creates a dedicated bridge network for this sandbox session with restricted internal access."""
         if self.use_mock: return
         try:
             network_name = f"net-{self.session_id}"
-            self.network = self.client.networks.create(network_name, driver="bridge")
-            logger.info(f"Created dedicated network: {network_name}")
+            # Create network with internal=True to isolate from host and internet
+            # Only sidecars and the main execution container will be on this network
+            self.network = self.client.networks.create(
+                network_name, 
+                driver="bridge",
+                internal=True,
+                labels={"com.exorcist.session": self.session_id}
+            )
+            logger.info(f"Created isolated network: {network_name}")
         except Exception as e:
             logger.error(f"Failed to create network: {e}")
 
@@ -120,7 +144,9 @@ print(f"DISK_FREE:{usage.free // (2**20)}MB")
             self.client.images.get(custom_image_tag)
             logger.info(f"Using cached image: {custom_image_tag}")
             if log_callback:
-                await log_callback(f"♻️ Using cached environment: {custom_image_tag}")
+                res = log_callback(f"♻️ Using cached environment: {custom_image_tag}")
+                if asyncio.iscoroutine(res):
+                    await res
             self.image = custom_image_tag
             return custom_image_tag
         except docker.errors.ImageNotFound:
@@ -132,7 +158,9 @@ print(f"DISK_FREE:{usage.free // (2**20)}MB")
         try:
             logger.info(f"Building dynamic sandbox image: {custom_image_tag}")
             if log_callback:
-                await log_callback(f"🏗️ Building fresh environment: {custom_image_tag}")
+                res = log_callback(f"🏗️ Building fresh environment: {custom_image_tag}")
+                if asyncio.iscoroutine(res):
+                    await res
                 
             build_logs = self.client.api.build(
                 fileobj=f,
@@ -145,15 +173,29 @@ print(f"DISK_FREE:{usage.free // (2**20)}MB")
                 if 'stream' in chunk:
                     log_line = chunk['stream'].strip()
                     if log_line:
-                        logger.info(f"Build Log: {log_line}")
+                        # Emit structured log for auditing
+                        logger.info("Docker build log", extra={
+                            "event": "build_log",
+                            "image": custom_image_tag,
+                            "output": log_line
+                        })
                         if log_callback:
-                            if hasattr(log_callback, 'send'): # Synchronous callback
-                                log_callback.send(log_line)
-                            else: # Asynchronous callback
-                                await log_callback(log_line)
+                            # Send structured update to callback
+                            log_data = {
+                                "message": log_line,
+                                "stage": "build",
+                                "image": custom_image_tag
+                            }
+                            res = log_callback(log_data)
+                            if asyncio.iscoroutine(res):
+                                await res
                 elif 'error' in chunk:
                     error_msg = chunk['error']
-                    logger.error(f"Build Error: {error_msg}")
+                    logger.error("Docker build failed", extra={
+                        "event": "build_error",
+                        "image": custom_image_tag,
+                        "error": error_msg
+                    })
                     raise Exception(f"Docker build failed: {error_msg}")
 
             self.image = custom_image_tag
@@ -185,7 +227,8 @@ print(f"DISK_FREE:{usage.free // (2**20)}MB")
                     name=f"sidecar-{name}-{self.session_id}",
                     environment=env,
                     detach=True,
-                    network=self.network.name if self.network else "bridge",
+                    network=self.network.name if self.network else "none",
+                    network_disabled=False if self.network else True,
                     healthcheck=healthcheck
                 )
                 self.sidecar_containers.append(container)
@@ -257,9 +300,13 @@ print(f"DISK_FREE:{usage.free // (2**20)}MB")
             
             # Volume configuration
             volumes = {}
+            project_root = os.path.abspath(self.project_path)
             for host_path, container_path in self.manifest.volumes.items():
-                # Ensure paths are absolute for Docker
-                abs_host_path = os.path.abspath(os.path.join(self.project_path, host_path))
+                # Ensure paths are absolute for Docker and within project root
+                abs_host_path = os.path.abspath(os.path.join(project_root, host_path))
+                if not abs_host_path.startswith(project_root):
+                    logger.warning(f"Security Warning: Blocked volume mount outside project root: {host_path}")
+                    continue
                 volumes[abs_host_path] = {'bind': container_path, 'mode': 'rw'}
 
             # Create the container with restrictions
@@ -272,6 +319,7 @@ print(f"DISK_FREE:{usage.free // (2**20)}MB")
                 volumes=volumes,
                 # Security restrictions
                 network=self.network.name if self.network else "none",
+                network_disabled=False if self.network else True, # Explicitly disable if no network
                 mem_limit=mem_limit,
                 nano_cpus=nano_cpus,
                 cap_drop=["ALL"] 

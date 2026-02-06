@@ -40,6 +40,13 @@ class BugAnalysisRequest(BaseModel):
         from app.main import sanitize_language
         return sanitize_language(v)
 
+    @validator("project_path")
+    def validate_project_path(cls, v):
+        from app.main import validate_paths
+        if v and not validate_paths(repo_path=None, project_path=v):
+            raise ValueError("Invalid or unauthorized project path")
+        return v
+
     class Config:
         json_schema_extra = {
             "example": {
@@ -354,7 +361,11 @@ async def fix_bug_with_retry(request: RetryFixRequest, db: Session = Depends(get
         bug_id = f"BUG-{bug_report.id}"
         
         # Initialize agent and run retry logic
-        agent = BugExorcistAgent(bug_id=bug_id, openai_api_key=request.openai_api_key)
+        agent = BugExorcistAgent(
+            bug_id=bug_id, 
+            openai_api_key=request.openai_api_key,
+            project_path="." # Default to current dir if not specified in request model
+        )
         result = await agent.analyze_and_fix_with_retry(
             error_message=request.error_message,
             code_snippet=request.code_snippet,
@@ -527,7 +538,7 @@ async def verify_fix(request: VerifyFixRequest) -> VerificationResponse:
     """
     try:
         # Use default project path for verification if not specified
-        agent = BugExorcistAgent(bug_id="verification-only")
+        agent = BugExorcistAgent(bug_id="verification-only", project_path=".")
         result = await agent.verify_fix(
             fixed_code=request.fixed_code,
             language=request.language
@@ -539,8 +550,11 @@ async def verify_fix(request: VerifyFixRequest) -> VerificationResponse:
             error=result.get('new_error')
         )
     except Exception as e:
-        logger.error(f"Verification endpoint failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Verification endpoint failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail="An internal error occurred during verification. Please check system logs for details."
+        )
 
 
 @router.post("/bugs/{bug_id}/verify", response_model=VerificationResponse)
@@ -575,7 +589,7 @@ async def verify_bug_fix(bug_id: str, request: VerifyFixRequest, db: Session = D
         raise HTTPException(status_code=404, detail="Bug not found")
     
     # Initialize agent
-    agent = BugExorcistAgent(bug_id=f"BUG-{numeric_id}")
+    agent = BugExorcistAgent(bug_id=f"BUG-{numeric_id}", project_path=".")
     
     # Verify the fix
     verification = await agent.verify_fix(request.fixed_code, language=request.language)

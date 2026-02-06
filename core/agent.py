@@ -14,6 +14,7 @@ to eliminate duplication between analyze_and_fix_with_retry and stream_thought_p
 
 import os
 import re
+import asyncio
 from datetime import datetime
 from typing import Dict, Optional, Any, List, AsyncGenerator, Callable, Awaitable
 from langchain_openai import ChatOpenAI
@@ -117,7 +118,6 @@ Be systematic, thorough, and learn from failures."""
         self.sandbox = Sandbox(project_path=project_path)
         
         # Initialize log queue for async log streaming
-        import asyncio
         self._temp_log_queue = asyncio.Queue()
 
     def _init_provider(self, agent_type: str, api_key: Optional[str] = None) -> Any:
@@ -179,7 +179,6 @@ Be systematic, thorough, and learn from failures."""
         # NEW: Ensure sandbox is provisioned before first attempt in non-streaming context
         if not on_attempt_start:
             # Running in silent/REST mode, build image without callback if needed
-            import asyncio
             # We can't easily await here if the caller didn't, but _execute_retry_logic is async
             await self.sandbox.build_image()
 
@@ -425,22 +424,39 @@ Be systematic, thorough, and learn from failures."""
             yield emit_status("🏗️ Building dynamic sandbox environment...", "provisioning")
             
             # Start the build in a task
+            async def wrapped_log_callback(msg):
+                self._temp_log_queue.put_nowait(msg)
+
             build_task = asyncio.create_task(self.sandbox.build_image(
-                log_callback=lambda msg: self._temp_log_queue.put_nowait(msg)
+                log_callback=wrapped_log_callback
             ))
             
             # While the build is running, flush logs
             while not build_task.done():
                 while not self._temp_log_queue.empty():
-                    log_msg = self._temp_log_queue.get_nowait()
-                    yield emit_thought(log_msg, "provisioning")
+                    log_data = self._temp_log_queue.get_nowait()
+                    if isinstance(log_data, dict):
+                        yield emit_thought(
+                            log_data.get("message", ""), 
+                            "provisioning", 
+                            {"image": log_data.get("image")}
+                        )
+                    else:
+                        yield emit_thought(log_data, "provisioning")
                 await asyncio.sleep(0.1) # Small delay to prevent busy waiting
                 
             # Final flush
             await build_task # Ensure it's finished and raise any errors
             while not self._temp_log_queue.empty():
-                log_msg = self._temp_log_queue.get_nowait()
-                yield emit_thought(log_msg, "provisioning")
+                log_data = self._temp_log_queue.get_nowait()
+                if isinstance(log_data, dict):
+                    yield emit_thought(
+                        log_data.get("message", ""), 
+                        "provisioning", 
+                        {"image": log_data.get("image")}
+                    )
+                else:
+                    yield emit_thought(log_data, "provisioning")
             
             # NEW: Run environment diagnostics after build
             yield emit_status("🔍 Running environment diagnostics...", "provisioning")
