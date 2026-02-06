@@ -30,6 +30,7 @@ class BugAnalysisRequest(BaseModel):
     file_path: Optional[str] = Field(None, description="Path to the file containing the bug")
     language: str = Field("python", description="The programming language of the code")
     additional_context: Optional[str] = Field(None, description="Additional context about the bug")
+    project_path: Optional[str] = Field(".", description="Path to the project root")
     openai_api_key: Optional[str] = Field(None, description="OpenAI API key (optional, uses env if not provided)")
     use_retry: bool = Field(True, description="Enable automatic retry logic (default: True)")
     max_attempts: int = Field(3, description="Maximum retry attempts (default: 3, max: 5)", ge=1, le=5)
@@ -200,7 +201,11 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
         crud.create_session(db=db, session_id=session_id, bug_report_id=bug_report.id)
         
         # Initialize agent
-        agent = BugExorcistAgent(bug_id=bug_id, openai_api_key=request.openai_api_key)
+        agent = BugExorcistAgent(
+            bug_id=bug_id, 
+            openai_api_key=request.openai_api_key,
+            project_path=request.project_path or "."
+        )
         
         if request.use_retry:
             # Use retry logic
@@ -514,6 +519,29 @@ async def list_bugs(skip: int = 0, limit: int = 100, db: Session = Depends(get_d
         bugs=bug_responses,
         count=len(bug_responses)
     )
+
+@router.post("/verify", response_model=VerificationResponse)
+async def verify_fix(request: VerifyFixRequest) -> VerificationResponse:
+    """
+    Verify a fix in the secure Docker sandbox.
+    """
+    try:
+        # Use default project path for verification if not specified
+        agent = BugExorcistAgent(bug_id="verification-only")
+        result = await agent.verify_fix(
+            fixed_code=request.fixed_code,
+            language=request.language
+        )
+        
+        return VerificationResponse(
+            verified=result['verified'],
+            output=result['output'],
+            error=result.get('new_error')
+        )
+    except Exception as e:
+        logger.error(f"Verification endpoint failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/bugs/{bug_id}/verify", response_model=VerificationResponse)
 async def verify_bug_fix(bug_id: str, request: VerifyFixRequest, db: Session = Depends(get_db)) -> VerificationResponse:

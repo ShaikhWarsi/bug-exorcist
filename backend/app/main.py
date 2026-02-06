@@ -249,11 +249,12 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
             await websocket.close()
             return
         
-        # Extract parameters
-        error_message = request_data.get("error_message", "")
-        code_snippet = request_data.get("code_snippet", "")
-        file_path = request_data.get("file_path")
-        repo_path = request_data.get("repo_path") # Optional: used for git operations
+            # Extract parameters
+            error_message = request_data.get("error_message", "")
+            code_snippet = request_data.get("code_snippet", "")
+            file_path = request_data.get("file_path")
+            repo_path = request_data.get("repo_path") # Optional: used for git operations
+            project_path = request_data.get("project_path", repo_path or ".")
         
         # Security: Validate paths to prevent traversal
         if not validate_paths(repo_path, file_path):
@@ -320,7 +321,7 @@ async def thought_stream_websocket(websocket: WebSocket, session_id: str) -> Non
             total_cost = 0.0
             
             # Initialize agent with streaming capability
-            agent = BugExorcistAgent(bug_id=bug_id)
+            agent = BugExorcistAgent(bug_id=bug_id, project_path=project_path)
             
             # Start thought stream
             last_result = None
