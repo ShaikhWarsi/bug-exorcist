@@ -23,6 +23,16 @@ from core.gemini_agent import GeminiFallbackAgent, is_gemini_available
 from core.ollama_provider import get_ollama_llm, is_ollama_available
 
 
+class MockLLM:
+    def __init__(self, model_name="mock-ai"):
+        self.model_name = model_name
+
+    async def ainvoke(self, messages):
+        # Very basic mock response logic
+        content = "Root Cause Analysis: Division by zero.\nComplete fixed code:\ndef divide(a, b):\n    if b == 0:\n        return 0\n    return a / b\n\ndivide(10, 0)\nExplanation: Added a check for b == 0."
+        from langchain_core.messages import AIMessage
+        return AIMessage(content=content)
+
 class BugExorcistAgent:
     """
     Autonomous debugging agent that analyzes and fixes bugs using AI.
@@ -106,10 +116,15 @@ Be systematic, thorough, and learn from failures."""
 
     def _init_provider(self, agent_type: str, api_key: Optional[str] = None) -> Any:
         """Initialize a specific AI provider based on type."""
+        # Check if MockLLM is explicitly enabled via environment flag
+        allow_mock = os.getenv("ALLOW_MOCK_LLM", "false").lower() == "true"
+
         if agent_type == "gpt-4o":
             key = api_key or os.getenv("OPENAI_API_KEY")
             if not key:
-                return None
+                if allow_mock:
+                    return MockLLM("mock-gpt-4o")
+                raise ValueError("OPENAI_API_KEY is not configured and ALLOW_MOCK_LLM is false")
             return ChatOpenAI(
                 model="gpt-4o",
                 temperature=0.2,
@@ -121,11 +136,19 @@ Be systematic, thorough, and learn from failures."""
                 from core.gemini_agent import GeminiFallbackAgent
                 gemini = GeminiFallbackAgent()
                 return gemini.llm
+            if allow_mock:
+                return MockLLM("mock-gemini")
+            raise ValueError("Gemini provider is not available (check GOOGLE_API_KEY) and ALLOW_MOCK_LLM is false")
         elif agent_type == "ollama":
             if is_ollama_available():
                 return get_ollama_llm()
+            if allow_mock:
+                return MockLLM("mock-ollama")
+            raise ValueError("Ollama provider is not available and ALLOW_MOCK_LLM is false")
         
-        return None
+        if allow_mock:
+            return MockLLM("mock-default")
+        raise ValueError(f"Unknown agent type '{agent_type}' and ALLOW_MOCK_LLM is false")
 
     async def _execute_retry_logic(
         self,
@@ -139,11 +162,13 @@ Be systematic, thorough, and learn from failures."""
         on_fix_generated: Optional[Callable[[int, Dict[str, Any]], Awaitable[None]]] = None,
         on_verification_complete: Optional[Callable[[int, Dict[str, Any], bool], Awaitable[None]]] = None,
         on_attempt_failed: Optional[Callable[[int, str], Awaitable[None]]] = None
-    ) -> Dict[str, Any]:
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         **PRIVATE SHARED HELPER** - Execute retry logic for bug fixing.
+        Returns an AsyncGenerator that yields events (if any) and finally yields the result dictionary.
         """
         all_attempts = []
+        final_result = None
         
         for attempt_num in range(1, max_attempts + 1):
             # Determine which AI to use
@@ -169,7 +194,8 @@ Be systematic, thorough, and learn from failures."""
 
             # Notify: attempt starting
             if on_attempt_start:
-                await on_attempt_start(attempt_num, ai_model, use_secondary)
+                event = await on_attempt_start(attempt_num, ai_model, use_secondary)
+                if event: yield event
             
             try:
                 # Perform analysis
@@ -185,7 +211,8 @@ Be systematic, thorough, and learn from failures."""
                 
                 # Notify: fix generated
                 if on_fix_generated:
-                    await on_fix_generated(attempt_num, fix_result)
+                    event = await on_fix_generated(attempt_num, fix_result)
+                    if event: yield event
                 
                 # Verify the fix
                 verification = await self.verify_fix(
@@ -209,11 +236,12 @@ Be systematic, thorough, and learn from failures."""
                 
                 # Notify: verification complete
                 if on_verification_complete:
-                    await on_verification_complete(attempt_num, verification, verification['verified'])
+                    event = await on_verification_complete(attempt_num, verification, verification['verified'])
+                    if event: yield event
                 
                 # Check if fix is verified
                 if verification['verified']:
-                    return {
+                    final_result = {
                         "success": True,
                         "final_fix": fix_result,
                         "all_attempts": all_attempts,
@@ -221,10 +249,12 @@ Be systematic, thorough, and learn from failures."""
                         "message": f"Bug fixed successfully on attempt {attempt_num}",
                         "ai_model": ai_model
                     }
+                    break
                 
                 # Notify: attempt failed
                 if on_attempt_failed and attempt_num < max_attempts:
-                    await on_attempt_failed(attempt_num, verification.get('new_error', 'Verification failed'))
+                    event = await on_attempt_failed(attempt_num, verification.get('new_error', 'Verification failed'))
+                    if event: yield event
                 
             except Exception as e:
                 # Record failed attempt
@@ -239,39 +269,43 @@ Be systematic, thorough, and learn from failures."""
                 
                 # Notify: attempt failed
                 if on_attempt_failed and attempt_num < max_attempts:
-                    await on_attempt_failed(attempt_num, str(e))
+                    event = await on_attempt_failed(attempt_num, str(e))
+                    if event: yield event
                 
                 if attempt_num >= max_attempts:
                     break
         
         # All attempts exhausted - check for fallback
-        if self.fallback_handler.is_enabled():
-            fallback_response = self.fallback_handler.generate_fallback_response(
-                error_message=error_message,
-                code_snippet=code_snippet,
-                bug_id=self.bug_id,
-                total_attempts=len(all_attempts),
-                all_attempts=all_attempts
-            )
-            
-            return {
-                "success": False,
-                "final_fix": None,
-                "all_attempts": all_attempts,
-                "total_attempts": len(all_attempts),
-                "message": f"Failed to fix bug after {len(all_attempts)} attempts. Fallback guidance provided.",
-                "last_error": all_attempts[-1].get('new_error') or all_attempts[-1].get('error') if all_attempts else None,
-                "fallback_response": fallback_response
-            }
-        else:
-            return {
-                "success": False,
-                "final_fix": None,
-                "all_attempts": all_attempts,
-                "total_attempts": len(all_attempts),
-                "message": f"Failed to fix bug after {len(all_attempts)} attempts",
-                "last_error": all_attempts[-1].get('new_error') or all_attempts[-1].get('error') if all_attempts else None
-            }
+        if not final_result:
+            if self.fallback_handler.is_enabled():
+                fallback_response = self.fallback_handler.generate_fallback_response(
+                    error_message=error_message,
+                    code_snippet=code_snippet,
+                    bug_id=self.bug_id,
+                    total_attempts=len(all_attempts),
+                    all_attempts=all_attempts
+                )
+                
+                final_result = {
+                    "success": False,
+                    "final_fix": None,
+                    "all_attempts": all_attempts,
+                    "total_attempts": len(all_attempts),
+                    "message": f"Failed to fix bug after {len(all_attempts)} attempts. Fallback guidance provided.",
+                    "last_error": all_attempts[-1].get('new_error') or all_attempts[-1].get('error') if all_attempts else None,
+                    "fallback_response": fallback_response
+                }
+            else:
+                final_result = {
+                    "success": False,
+                    "final_fix": None,
+                    "all_attempts": all_attempts,
+                    "total_attempts": len(all_attempts),
+                    "message": f"Failed to fix bug after {len(all_attempts)} attempts",
+                    "last_error": all_attempts[-1].get('new_error') or all_attempts[-1].get('error') if all_attempts else None
+                }
+        
+        yield final_result
 
     async def analyze_and_fix_with_retry(
         self,
@@ -305,7 +339,8 @@ Be systematic, thorough, and learn from failures."""
             - message: str
             - last_error: str (if failed)
         """
-        return await self._execute_retry_logic(
+        result = None
+        async for event in self._execute_retry_logic(
             error_message=error_message,
             code_snippet=code_snippet,
             file_path=file_path,
@@ -313,7 +348,9 @@ Be systematic, thorough, and learn from failures."""
             max_attempts=min(max_attempts, 5),
             language=language
             # No callbacks - REST endpoint doesn't need streaming
-        )
+        ):
+            result = event
+        return result
 
     async def stream_thought_process(
         self,
@@ -400,21 +437,15 @@ Be systematic, thorough, and learn from failures."""
                 # Define callbacks for the shared retry logic
                 async def on_attempt_start(attempt_num: int, ai_model: str, using_secondary: bool):
                     """Called before each attempt"""
-                    yield emit_thought(
+                    return emit_thought(
                         f"🤖 Attempt {attempt_num}/{max_attempts}: Requesting AI analysis...",
                         "analysis",
                         {"attempt": attempt_num, "total_attempts": max_attempts, "using_secondary": using_secondary}
                     )
-                    
-                    yield emit_thought(
-                        f"Using {ai_model} for analysis...",
-                        "analysis",
-                        {"model": ai_model, "attempt": attempt_num}
-                    )
                 
                 async def on_fix_generated(attempt_num: int, fix_result: Dict[str, Any]):
                     """Called after AI generates a fix"""
-                    yield emit_thought(
+                    return emit_thought(
                         f"✅ AI generated a fix (confidence: {fix_result.get('confidence', 0):.0%})",
                         "analysis",
                         {
@@ -424,69 +455,30 @@ Be systematic, thorough, and learn from failures."""
                             "usage": fix_result.get('usage', {})
                         }
                     )
-                    
-                    yield emit_status(
-                        "💻 Fix generated, preparing for verification...",
-                        "fixing"
-                    )
-                    
-                    yield emit_thought(
-                        "Root cause identified",
-                        "fixing",
-                        {"root_cause": fix_result.get('root_cause', '')}
-                    )
                 
                 async def on_verification_complete(attempt_num: int, verification: Dict[str, Any], verified: bool):
                     """Called after verification completes"""
-                    yield emit_status(
-                        "🧪 Verifying fix in sandbox...",
-                        "verification"
-                    )
-                    
-                    yield emit_thought(
-                        "Executing code in isolated Docker container...",
-                        "verification"
-                    )
-                    
-                    if verified:
-                        yield emit_status(
-                            f"✅ Fix verified successfully on attempt {attempt_num}!",
-                            "complete"
-                        )
+                    error_msg = verification.get('new_error', 'Unknown error')
+                    # Sanitize error message to avoid leaking internal details/tracebacks
+                    display_error = error_msg.split('\n')[0] if error_msg else "Unknown error"
+                    if len(display_error) > 100:
+                        display_error = display_error[:97] + "..."
                         
-                        yield emit_thought(
-                            f"Bug exorcised! 🎉",
-                            "complete",
-                            {
-                                "success": True,
-                                "attempts": attempt_num
-                            }
-                        )
-                    else:
-                        yield emit_thought(
-                            f"❌ Verification failed: {verification.get('new_error', 'Unknown error')[:100]}",
-                            "verification",
-                            {
-                                "attempt": attempt_num,
-                                "error": verification.get('new_error', '')[:200]
-                            }
-                        )
+                    return emit_status(
+                        f"✅ Fix verified successfully on attempt {attempt_num}!" if verified else f"❌ Verification failed: {display_error}",
+                        "complete" if verified else "verification",
+                        {"verified": verified, "attempt": attempt_num}
+                    )
                 
                 async def on_attempt_failed(attempt_num: int, error_msg: str):
                     """Called when an attempt fails"""
-                    if attempt_num < max_attempts:
-                        yield emit_thought(
-                            f"Preparing retry {attempt_num + 1}/{max_attempts}...",
-                            "verification"
-                        )
-                    else:
-                        yield emit_thought(
-                            f"Maximum attempts ({max_attempts}) reached",
-                            "verification"
-                        )
+                    return emit_thought(
+                        f"Preparing retry {attempt_num + 1}/{max_attempts}..." if attempt_num < max_attempts else f"Maximum attempts ({max_attempts}) reached",
+                        "verification"
+                    )
                 
                 # Execute shared retry logic with streaming callbacks
-                result = await self._execute_retry_logic(
+                async for event in self._execute_retry_logic(
                     error_message=error_message,
                     code_snippet=code_snippet,
                     file_path=file_path,
@@ -497,7 +489,11 @@ Be systematic, thorough, and learn from failures."""
                     on_fix_generated=on_fix_generated,
                     on_verification_complete=on_verification_complete,
                     on_attempt_failed=on_attempt_failed
-                )
+                ):
+                    if isinstance(event, dict) and "success" in event:
+                        result = event
+                    else:
+                        yield event
                 
                 # Emit final result
                 if result['success']:
@@ -629,11 +625,6 @@ Be systematic, thorough, and learn from failures."""
         """
         Analyze an error and generate a fix using AI.
         """
-        # Sanitize language for prompt safety
-        safe_language = re.sub(r'[^a-zA-Z0-9\-]', '', language).strip() or "python"
-        
-        attempt_number = len(previous_attempts) + 1 if previous_attempts else 1
-        
         # Determine which provider to use
         provider = self.secondary_provider if use_secondary else self.primary_provider
         
@@ -644,6 +635,27 @@ Be systematic, thorough, and learn from failures."""
         if provider is None:
             raise ValueError("No AI providers are configured")
 
+        # Centralized analysis logic for MockLLM
+        if isinstance(provider, MockLLM):
+            # Return a controlled mock response that will pass verification
+            return {
+                "ai_agent": provider.model_name,
+                "provider_mode": "mock",
+                "root_cause": "Division by zero.",
+                "fixed_code": "def divide(a, b):\n    if b == 0: return 0\n    return a / b",
+                "explanation": "Added check for zero.",
+                "confidence": 0.95,
+                "original_error": error_message,
+                "timestamp": datetime.now().isoformat(),
+                "attempt_number": len(previous_attempts or []) + 1,
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "estimated_cost": 0.0, "model": provider.model_name}
+            }
+
+        # Sanitize language for prompt safety
+        safe_language = re.sub(r'[^a-zA-Z0-9\-]', '', language).strip() or "python"
+        
+        attempt_number = len(previous_attempts) + 1 if previous_attempts else 1
+        
         # All analysis logic is now centralized here
         # Construct the analysis prompt
         user_prompt = f"""Analyze and fix this bug:
@@ -736,6 +748,7 @@ Please provide:
             
             return {
                 "ai_agent": model_name,
+                "provider_mode": "real",
                 "root_cause": result["root_cause"],
                 "fixed_code": result["fixed_code"],
                 "explanation": result["explanation"],
@@ -883,37 +896,58 @@ Please provide:
         original_error: Optional[str] = None,
         language: str = "python"
     ) -> Dict[str, Any]:
-        """
-        Verify a fix by running it in the sandbox.
-        
-        Args:
-            fixed_code: The fixed code to verify
-            original_error: Optional original error for comparison
-            language: The programming language of the code
-            
-        Returns:
-            Dictionary containing verification results
-        """
+        """Verify the fix in the sandbox."""
+        # Real verification logic with robust exception handling
         try:
-            result = self.sandbox.run_code(fixed_code, language=language)
+            # Use the existing sandbox instance
+            sandbox = self.sandbox
+            result = sandbox.run_code(fixed_code, language)
             
-            # Check if execution was successful
-            verified = not result.startswith("Error")
-            
-            return {
-                "verified": verified,
-                "output": result,
-                "new_error": result if not verified else None,
-                "timestamp": datetime.now().isoformat()
-            }
-            
+            # Check if Mock Sandbox is being used
+            if getattr(sandbox, "use_mock", False):
+                allow_mock_sandbox = os.getenv("ALLOW_MOCK_SANDBOX_VERIFICATION", "false").lower() == "true"
+                if not allow_mock_sandbox:
+                    return {
+                        "verified": False,
+                        "output": "Sandbox unavailable: Docker not reachable and mock verification is disabled.",
+                        "new_error": "Sandbox unavailable: Docker not reachable",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                # If mock is allowed, treat as verified for testing
+                return {
+                    "verified": True, 
+                    "output": "Mock verification passed (Docker not available).", 
+                    "new_error": None, 
+                    "timestamp": datetime.now().isoformat()
+                }
         except Exception as e:
+            # Handle sandbox initialization/execution errors gracefully
+            error_type = type(e).__name__
+            error_details = str(e)
             return {
                 "verified": False,
-                "output": "",
-                "new_error": str(e),
+                "output": f"Sandbox error ({error_type}): {error_details}",
+                "new_error": f"Verification system error: {error_type}",
                 "timestamp": datetime.now().isoformat()
             }
+        
+        # Check if original error is gone
+        verified = True
+        new_error = None
+        
+        if original_error and original_error in result:
+            verified = False
+            new_error = f"Original error persists: {original_error}"
+        elif "Error" in result or "Traceback" in result:
+            verified = False
+            new_error = result
+            
+        return {
+            "verified": verified,
+            "output": result,
+            "new_error": new_error,
+            "timestamp": datetime.now().isoformat()
+        }
 
     async def execute_full_workflow(
         self,

@@ -70,3 +70,23 @@ def update_session_usage(db: Session, session_id: str, prompt_tokens: int, compl
         logger.error(f"Error updating session usage for {session_id}: {e}")
         db.rollback()
         return None
+
+def update_session_approval(db: Session, session_id: str, is_approved: int, fixed_code: str = None, repo_path: str = None, file_path: str = None):
+    db_session = db.query(models.Session).filter(models.Session.id == session_id).first()
+    if not db_session:
+        return None
+    try:
+        db_session.is_approved = is_approved
+        if fixed_code:
+            db_session.fixed_code = fixed_code
+        if repo_path:
+            db_session.repo_path = repo_path
+        if file_path:
+            db_session.file_path = file_path
+        db.commit()
+        db.refresh(db_session)
+        return db_session
+    except Exception as e:
+        logger.error(f"Error updating session approval for {session_id}: {e}")
+        db.rollback()
+        return None

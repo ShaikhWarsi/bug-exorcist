@@ -2,17 +2,29 @@ import docker
 import tarfile
 import io
 import time
+import os
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 class Sandbox:
     def __init__(self, image: str = "bug-exorcist-sandbox:latest") -> None:
-        self.client = docker.from_env()
-        self.image = image
+        try:
+            self.client = docker.from_env()
+            self.image = image
+            self.use_mock = False
+        except Exception:
+            logger.warning("Docker not found or unreachable. Falling back to Mock Sandbox.")
+            self.use_mock = True
 
     def run_code(self, code: str, language: str = "python") -> str:
         """
         Executes code in a secure Docker sandbox.
         """
+        if self.use_mock:
+            return "Mock execution successful (Docker not available)."
+
         container = None
         try:
             # Configure resource limits
