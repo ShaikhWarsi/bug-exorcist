@@ -89,7 +89,7 @@ Provide:
 
 Be systematic, thorough, and learn from failures."""
 
-    def __init__(self, bug_id: str, openai_api_key: Optional[str] = None, project_path: str = "."):
+    def __init__(self, bug_id: str, openai_api_key: Optional[str] = None, project_path: str = ".", rag: Optional[Any] = None):
         """
         Initialize the Bug Exorcist Agent.
         
@@ -97,6 +97,7 @@ Be systematic, thorough, and learn from failures."""
             bug_id: Unique identifier for this bug
             openai_api_key: OpenAI API key (uses env var if not provided)
             project_path: Path to the project root
+            rag: Injected RAG engine instance
         """
         self.bug_id = bug_id
         self.project_path = project_path
@@ -120,11 +121,14 @@ Be systematic, thorough, and learn from failures."""
         # Initialize log queue for async log streaming
         self._temp_log_queue = asyncio.Queue()
 
-        # Initialize RAG system
-        from core.rag_engine import CodebaseRAG
-        self.rag = CodebaseRAG(project_path=project_path)
-        # On-demand indexing for now (background worker to be added)
-        self.rag.index_project()
+        # Use injected RAG or initialize if enabled
+        if rag:
+            self.rag = rag
+        elif os.getenv("ENABLE_RAG", "true").lower() == "true":
+            from core.rag_engine import CodebaseRAG
+            self.rag = CodebaseRAG(project_path=project_path)
+        else:
+            self.rag = None
 
     def _init_provider(self, agent_type: str, api_key: Optional[str] = None) -> Any:
         """Initialize a specific AI provider based on type."""
@@ -170,7 +174,6 @@ Be systematic, thorough, and learn from failures."""
         additional_context: Optional[str] = None,
         max_attempts: int = 3,
         language: str = "python",
-        session_id: Optional[str] = None,
         on_attempt_start: Optional[Callable[[int, str, bool], Awaitable[None]]] = None,
         on_fix_generated: Optional[Callable[[int, Dict[str, Any]], Awaitable[None]]] = None,
         on_verification_complete: Optional[Callable[[int, Dict[str, Any], bool], Awaitable[None]]] = None,
@@ -225,8 +228,7 @@ Be systematic, thorough, and learn from failures."""
                     additional_context=additional_context,
                     previous_attempts=all_attempts,
                     use_secondary=use_secondary,
-                    language=language,
-                    session_id=session_id
+                    language=language
                 )
                 
                 # Notify: fix generated
@@ -368,8 +370,7 @@ Be systematic, thorough, and learn from failures."""
             file_path=file_path,
             additional_context=additional_context,
             max_attempts=min(max_attempts, 5),
-            language=language,
-            session_id=session_id
+            language=language
             # No callbacks - REST endpoint doesn't need streaming
         ):
             result = event
@@ -568,7 +569,6 @@ Be systematic, thorough, and learn from failures."""
                     additional_context=additional_context,
                     max_attempts=max_attempts,
                     language=language,
-                    session_id=session_id,
                     on_attempt_start=on_attempt_start,
                     on_fix_generated=on_fix_generated,
                     on_verification_complete=on_verification_complete,
@@ -708,8 +708,7 @@ Be systematic, thorough, and learn from failures."""
         additional_context: Optional[str] = None,
         previous_attempts: Optional[List[Dict[str, Any]]] = None,
         use_secondary: bool = False,
-        language: str = "python",
-        session_id: Optional[str] = None
+        language: str = "python"
     ) -> Dict[str, Any]:
         """
         Analyze an error and generate a fix using AI.
@@ -747,22 +746,14 @@ Be systematic, thorough, and learn from failures."""
         attempt_number = len(previous_attempts) + 1 if previous_attempts else 1
         
         # All analysis logic is now centralized here
-        # Get RAG context for the bug
-        rag_query = f"Fix {error_message} in {file_path if file_path else 'code'}: {code_snippet[:200]}"
-        rag_data = self.rag.get_context_summary(rag_query)
-        rag_context = rag_data["summary"]
-        referenced_files = rag_data["referenced_files"]
-
-        # Update DB with referenced files if session_id is provided
-        if session_id:
-            try:
-                from app import crud
-                from app.database import SessionLocal
-                with SessionLocal() as db:
-                    crud.update_session_referenced_files(db, session_id, referenced_files)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).error(f"Failed to update referenced files for session {session_id}: {e}")
+        # Get RAG context for the bug if RAG is enabled
+        rag_context = "RAG is disabled."
+        referenced_files = []
+        if self.rag:
+            rag_query = f"Fix {error_message} in {file_path if file_path else 'code'}: {code_snippet[:200]}"
+            rag_data = self.rag.get_context_summary(rag_query)
+            rag_context = rag_data["summary"]
+            referenced_files = rag_data["referenced_files"]
 
         # Construct the analysis prompt
         user_prompt = f"""Analyze and fix this bug:

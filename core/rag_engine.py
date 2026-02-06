@@ -3,6 +3,7 @@ import logging
 import asyncio
 import hashlib
 import json
+import threading
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -22,7 +23,21 @@ class CodebaseRAG:
     def __init__(self, project_path: str, persist_directory: str = "./.chroma_db"):
         self.project_path = Path(project_path).resolve()
         self.persist_directory = persist_directory
-        self.embeddings = OpenAIEmbeddings()
+        
+        # Configure embeddings
+        embedding_provider = os.getenv("RAG_EMBEDDING_PROVIDER", "openai").lower()
+        if embedding_provider == "huggingface":
+            try:
+                from langchain_community.embeddings import HuggingFaceEmbeddings
+                self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+                logger.info("Using local HuggingFace embeddings (all-MiniLM-L6-v2)")
+            except ImportError:
+                logger.warning("HuggingFaceEmbeddings not available, falling back to OpenAI")
+                self.embeddings = OpenAIEmbeddings()
+        else:
+            self.embeddings = OpenAIEmbeddings()
+            logger.info("Using OpenAI embeddings (remote)")
+
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=100,
@@ -32,11 +47,21 @@ class CodebaseRAG:
         self.vector_store = None
         self.hash_file = Path(self.persist_directory) / "file_hashes.json"
         self.indexing_task = None
+        self._lock = threading.Lock()
         self._initialize_db()
 
     def _initialize_db(self):
         """Initialize or load the ChromaDB vector store."""
         try:
+            # Retention control: If DB is too old, clear it
+            if os.path.exists(self.persist_directory):
+                retention_days = int(os.getenv("RAG_RETENTION_DAYS", "30"))
+                mtime = os.path.getmtime(self.persist_directory)
+                if (datetime.now().timestamp() - mtime) > (retention_days * 86400):
+                    logger.info(f"RAG: Persist directory older than {retention_days} days. Clearing for security.")
+                    import shutil
+                    shutil.rmtree(self.persist_directory)
+
             os.makedirs(self.persist_directory, exist_ok=True)
             self.vector_store = Chroma(
                 persist_directory=self.persist_directory,
@@ -83,11 +108,20 @@ class CodebaseRAG:
             while True:
                 try:
                     logger.info("Starting scheduled project indexing...")
-                    self.index_project(force=False)
+                    # Run indexing in a threadpool to avoid blocking the event loop
+                    await asyncio.to_thread(self.index_project, force=False)
                     logger.info(f"Indexing complete. Sleeping for {interval_seconds}s.")
+                except asyncio.CancelledError:
+                    logger.info("Background indexing task cancelled.")
+                    break
                 except Exception as e:
                     logger.error(f"Error in background indexing: {e}")
-                await asyncio.sleep(interval_seconds)
+                
+                try:
+                    await asyncio.sleep(interval_seconds)
+                except asyncio.CancelledError:
+                    logger.info("Background indexing task cancelled during sleep.")
+                    break
 
         self.indexing_task = asyncio.create_task(_indexer_loop())
         logger.info(f"Background indexing started with interval {interval_seconds}s")
@@ -95,13 +129,29 @@ class CodebaseRAG:
     def index_project(self, force: bool = False):
         """
         Scan and index relevant files in the project incrementally.
+        Thread-safe implementation with a lock.
         """
-        if not self.project_path.exists():
-            logger.error(f"Project path does not exist: {self.project_path}")
-            return
+        with self._lock:
+            if not self.project_path.exists():
+                logger.error(f"Project path does not exist: {self.project_path}")
+                return
 
-        valid_extensions = {'.py', '.js', '.ts', '.tsx', '.go', '.rs', '.java', '.c', '.cpp', '.h', '.yaml', '.yml', '.md'}
+        # Directories to ignore
         ignored_dirs = {'node_modules', '.git', '__pycache__', '.chroma_db', 'venv', 'env', 'dist', 'build'}
+        
+        # Extensions for non-text/binary files that should always be skipped
+        binary_extensions = {
+            '.pyc', '.exe', '.dll', '.so', '.dylib', '.bin', '.obj', '.o', '.a', '.lib',
+            '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.pdf', '.zip', '.tar', '.gz', 
+            '.7z', '.rar', '.woff', '.woff2', '.ttf', '.eot', '.mp4', '.mp3', '.wav'
+        }
+
+        # Explicit deny list for sensitive files and patterns
+        deny_patterns = [
+            r'.*secret.*', r'.*key.*', r'.*\.pem$', r'.*\.crt$', r'.*\.env.*', 
+            r'.*token.*', r'.*password.*', r'.*credential.*', r'.*\.db$', r'.*\.sqlite$'
+        ]
+        import re
 
         current_hashes = self._load_hashes()
         new_hashes = {}
@@ -109,8 +159,18 @@ class CodebaseRAG:
         
         # Scan files and check for changes
         for file_path in self.project_path.rglob('*'):
-            if file_path.is_file() and file_path.suffix in valid_extensions:
+            if file_path.is_file():
+                # Skip if file is in an ignored directory
                 if any(ignored in str(file_path) for ignored in ignored_dirs):
+                    continue
+                
+                # Skip binary/non-text files
+                if file_path.suffix.lower() in binary_extensions:
+                    continue
+
+                # Check against deny patterns
+                if any(re.match(pattern, file_path.name, re.IGNORECASE) for pattern in deny_patterns):
+                    logger.debug(f"Skipping sensitive file: {file_path}")
                     continue
 
                 try:

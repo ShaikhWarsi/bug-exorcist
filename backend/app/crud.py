@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 from typing import Optional, List
 from . import models
 
+logger = logging.getLogger(__name__)
+
 def get_bug_report(db: Session, bug_report_id: int) -> Optional[models.BugReport]:
     return db.query(models.BugReport).filter(models.BugReport.id == bug_report_id).first()
 
