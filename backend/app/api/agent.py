@@ -73,6 +73,7 @@ class BugAnalysisResponse(BaseModel):
     timestamp: str
     attempt_number: Optional[int] = 1
     usage: Optional[Dict[str, Any]] = None
+    referenced_files: Optional[List[str]] = []
 
 
 class RetryFixRequest(BaseModel):
@@ -251,6 +252,10 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
                 crud.update_bug_report_status(db=db, bug_report_id=bug_report.id, status="fixed")
                 final_fix = retry_result['final_fix']
                 
+                # Update referenced files in DB
+                if final_fix.get('referenced_files'):
+                    crud.update_session_referenced_files(db=db, session_id=session_id, files=final_fix['referenced_files'])
+                
                 return BugAnalysisResponse(
                     bug_id=bug_id,
                     root_cause=final_fix['root_cause'],
@@ -267,7 +272,8 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
                         "total_tokens": total_prompt_tokens + total_completion_tokens,
                         "estimated_cost": f"{total_cost:.6f}",
                         "session_id": session_id
-                    }
+                    },
+                    referenced_files=final_fix.get('referenced_files', [])
                 )
             else:
                 crud.update_bug_report_status(db=db, bug_report_id=bug_report.id, status="failed")
@@ -312,6 +318,10 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
             # Update bug report status
             crud.update_bug_report_status(db=db, bug_report_id=bug_report.id, status="analyzed")
             
+            # Update referenced files in DB
+            if result.get('referenced_files'):
+                crud.update_session_referenced_files(db=db, session_id=session_id, files=result['referenced_files'])
+            
             return BugAnalysisResponse(
                 bug_id=bug_id,
                 root_cause=result['root_cause'],
@@ -324,7 +334,8 @@ async def analyze_bug(request: BugAnalysisRequest, db: Session = Depends(get_db)
                 usage={
                     **usage,
                     "session_id": session_id
-                }
+                },
+                referenced_files=result.get('referenced_files', [])
             )
         
     except HTTPException:

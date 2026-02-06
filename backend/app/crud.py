@@ -1,4 +1,5 @@
 import logging
+import json
 from sqlalchemy.orm import Session
 from typing import Optional, List
 from . import models
@@ -88,5 +89,23 @@ def update_session_approval(db: Session, session_id: str, is_approved: int, fixe
         return db_session
     except Exception as e:
         logger.error(f"Error updating session approval for {session_id}: {e}")
+        db.rollback()
+        return None
+
+def update_session_referenced_files(db: Session, session_id: str, files: List[str]):
+    """Update the list of files referenced by the AI for this session."""
+    db_session = db.query(models.Session).filter(models.Session.id == session_id).first()
+    if not db_session:
+        return None
+    try:
+        # Merge with existing files if any
+        existing = json.loads(db_session.referenced_files) if db_session.referenced_files else []
+        updated = list(set(existing + files))
+        db_session.referenced_files = json.dumps(updated)
+        db.commit()
+        db.refresh(db_session)
+        return db_session
+    except Exception as e:
+        logger.error(f"Error updating referenced files for {session_id}: {e}")
         db.rollback()
         return None

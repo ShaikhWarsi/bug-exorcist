@@ -130,6 +130,10 @@ def run_migrations():
             if "file_path" not in columns:
                 logger.info("Adding 'file_path' column to sessions table")
                 conn.execute(text("ALTER TABLE sessions ADD COLUMN file_path TEXT"))
+
+            if "referenced_files" not in columns:
+                logger.info("Adding 'referenced_files' column to sessions table")
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN referenced_files TEXT"))
             
             conn.commit()
             logger.info("Database migrations completed successfully")
@@ -182,6 +186,20 @@ app.add_middleware(
 # Include routers
 app.include_router(logs_router, tags=["logs"])
 app.include_router(agent_router, tags=["agent"])
+
+# Initialize RAG background indexing
+@app.on_event("startup")
+async def startup_event():
+    try:
+        from core.rag_engine import CodebaseRAG
+        project_path = os.getenv("ALLOWED_REPO_ROOT", ".")
+        rag = CodebaseRAG(project_path=project_path)
+        # Start background indexing with 1-hour interval
+        rag.start_background_indexing(interval_seconds=3600)
+        app.state.rag = rag
+        logger.info("RAG background indexing started.")
+    except Exception as e:
+        logger.error(f"Failed to start RAG background indexing: {e}")
 
 
 # NEW: Real-Time Thought Stream WebSocket Endpoint
